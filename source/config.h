@@ -207,6 +207,25 @@
  * to restore the cursors. */
 #define PHI_VIRTUAL_CURSOR 0
 
+/* ---- locale override ------------------------------------------------------
+ * Report en/US to the game when the Switch system language is Simplified or
+ * Traditional Chinese.
+ *
+ * Phigros' Chinese locales require a TapTap account login. That needs the real
+ * Java TapTap SDK and a live network session; this port has neither, and the
+ * in-game language menu is behind the login, so a Chinese console would reach a
+ * sign-in screen with no way forward and no way to change language. English has
+ * no such gate.
+ *
+ * The override is applied at the single point every locale query funnels
+ * through (lang_code() in jni_fake.c), so language, country and the ISO3 and
+ * display forms all agree -- a half-applied override that says "English" but
+ * "CN" is worse than either answer on its own.
+ *
+ * Set to 0 to report the real system locale. That is the correct setting if the
+ * login is ever solved; today it means a Chinese console cannot start the game. */
+#define PHI_FORCE_ENGLISH_FOR_ZH 1
+
 /* ---- NativeAudio device report -- THE LATENCY BUDGET ----------------------
  * Phigros drives chart audio and hitsounds through Exceed7 NativeAudio
  * (libnativeaudioe7.so) over OpenSL ES. Its Java Initialize() normally asks
@@ -252,6 +271,39 @@
  * retrying -- and if "short=" and "dry=" are still 0 while it stutters, the
  * cause is deadline misses and the fix is more headroom, not less. */
 #define PHI_AUDIO_DEVICE_RATE     PHI_AUDIO_SAMPLE_RATE
+
+/* ---- FMOD mix rate -- DELIBERATELY LOWER, DO NOT "UNIFY" ------------------
+ * What we report to Unity as AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE /
+ * PROPERTY_OUTPUT_FRAMES_PER_BUFFER. Unity configures FMOD's software mixer
+ * from these, so they set how hard FMOD has to work -- they are NOT a
+ * description of the output device, and they are NOT PHI_AUDIO_SAMPLE_RATE.
+ *
+ * This looked like an inconsistency (24000 here, 48000 everywhere else) and was
+ * "unified" to 48000 once. That reintroduced the stuttering audio immediately:
+ *
+ *     24000 Hz / 256 frames -> 10.7 ms deadline,  94 mixer wakeups/sec
+ *     48000 Hz / 256 frames ->  5.3 ms deadline, 188 mixer wakeups/sec
+ *
+ * Halving the deadline while doubling the samples is about 4x the pressure on a
+ * software mixer running on 3 cores shared with ~25 engine threads. FMOD misses
+ * buffers, the queue starves, and it sounds like repeating/stuttering audio.
+ *
+ * The shim resamples 24000 -> 48000 on the way out, which costs far less than
+ * asking FMOD to mix at twice the rate. CloverPit sets its device rate to 24000
+ * for exactly this reason. Music quality is not the constraint here; keeping up
+ * is. Raise it only if you have CPU headroom to spare and can verify no
+ * stutter. */
+#define PHI_FMOD_MIX_RATE   24000
+#define PHI_FMOD_MIX_FRAMES 256
+
+/* Compile-time tripwire. This value has been "tidied up" to match the device
+ * rate once already, costing a build to stuttering audio each time, because the
+ * two numbers look like they should agree and nothing stopped the edit. If you
+ * genuinely want FMOD mixing at the device rate, delete this check deliberately
+ * -- and then verify on hardware that music does not stutter. */
+#if PHI_FMOD_MIX_RATE >= PHI_AUDIO_SAMPLE_RATE
+#error "PHI_FMOD_MIX_RATE must stay BELOW PHI_AUDIO_SAMPLE_RATE -- see the comment above it. Raising it to the device rate brings back stuttering audio."
+#endif
 #define PHI_AUDIO_CALLBACK_FRAMES 1024
 
 #include "nx_root.h"   /* nx_root(), nx_rp() -- DATA_ROOT/GAME_HOME are these */

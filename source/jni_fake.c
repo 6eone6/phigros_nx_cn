@@ -571,12 +571,26 @@ static juint mov_int(const FakeID *id, va_list va) {
 #define MAIN_OBB_BASE "main.10007"
 
 static const char *lang_code(void) {
-  // PvZ Fusion ships Simplified Chinese + English; everything else -> English.
-  // NOTE: if the game expects a different token than "zh"/"en" (e.g. "zh-CN"),
-  // change the returned strings here -- see PORTING.md section 5.
-  // Always follow the Switch system language: the game exposes its own
-  // in-game language menu, so a port-side override could only contradict it.
-  // Resolve once (Chinese -> zh, else en).
+  // Every locale answer in this file funnels through here -- getLanguage,
+  // Locale.getCountry/getISO3*/toString/getDisplayName -- so one decision made
+  // here is consistent everywhere. A mixed answer (English language, CN
+  // country) is exactly the sort of thing that trips a region check.
+  //
+  // PHIGROS: Chinese locales are FORCED TO ENGLISH.
+  //
+  // Phigros gates its Chinese builds behind a mandatory TapTap account login.
+  // That login needs a real Java TapTap SDK and a network session, neither of
+  // which exists here, so a Chinese system language leaves the game sitting on
+  // a sign-in screen it can never get past -- unplayable, with no in-game way
+  // out, because the language menu is behind the login. English has no such
+  // gate. So a Chinese Switch reports "en"/"US" and the game boots straight
+  // into English.
+  //
+  // This is deliberately NOT "follow the system language" like the upstream
+  // tree: following it faithfully produces a game you cannot start. Set
+  // PHI_FORCE_ENGLISH_FOR_ZH to 0 in config.h to report the real locale --
+  // useful if the login is ever solved, and honest about the trade-off rather
+  // than silently overriding the player's system setting forever.
   static int zh = -1;
   if (zh < 0) {
     zh = 0;
@@ -587,6 +601,16 @@ static const char *lang_code(void) {
               sl == SetLanguage_ZHHANS || sl == SetLanguage_ZHHANT);
       setExit();
     }
+#if PHI_FORCE_ENGLISH_FOR_ZH
+    if (zh) {
+      zh = 0;
+      debugPrintf("[lang] system language is Chinese -> reporting en/US.\n"
+                  "[lang] The Chinese build requires a TapTap login that cannot\n"
+                  "[lang] work without a JVM and a network session, and the\n"
+                  "[lang] language menu sits behind it. English has no gate.\n"
+                  "[lang] Set PHI_FORCE_ENGLISH_FOR_ZH 0 to report the real locale.\n");
+    }
+#endif
   }
   return zh ? "zh" : "en";
 }
@@ -676,7 +700,30 @@ const char *jni_string_utf(void *jstr);
  * missing/unrecognised. 1 = sample rate, 2 = frames-per-buffer. */
 static int g_last_output_prop = 0;
 
+#define NX_STR2(x) #x
+#define NX_STR(x) NX_STR2(x)
+
 static void *getproperty_value(const char *key) {
+  /* Locale properties. Java code that asks System.getProperty("user.language")
+   * instead of going through Locale must get the SAME answer lang_code() gives,
+   * or the game sees English text with a CN region and can still take a
+   * region-gated path. One source of truth, every route. */
+  if (key && (strstr(key, "user.language") || strstr(key, "user.locale")))
+    return jni_make_string(lang_code());
+  if (key && (strstr(key, "user.country") || strstr(key, "user.region")))
+    return jni_make_string(!strcmp(lang_code(), "zh") ? "CN" : "US");
+
+  /* Audio properties: AudioManager's PROPERTY_OUTPUT_SAMPLE_RATE and
+   * PROPERTY_OUTPUT_FRAMES_PER_BUFFER. Unity configures FMOD's software MIXER
+   * from these, so they decide how hard FMOD has to work.
+   *
+   * These come from PHI_FMOD_MIX_* and NOT from PHI_AUDIO_SAMPLE_RATE. The 24000
+   * here is not a mismatch with the 48000 device rate -- it is a deliberate
+   * downclock, and unifying the two reintroduced stuttering audio at once
+   * (5.3 ms deadline and twice the samples instead of 10.7 ms). The shim
+   * resamples on the way out; that is far cheaper than making FMOD mix at
+   * double rate on three shared cores. See the note in config.h before
+   * changing either. */
   int which = 0;
   if (key && strstr(key, "SAMPLE_RATE"))            which = 1;
   else if (key && strstr(key, "FRAMES_PER_BUFFER")) which = 2;
@@ -684,11 +731,12 @@ static void *getproperty_value(const char *key) {
   static int logged[3] = {0, 0, 0};
   if (which >= 0 && which <= 2 && !logged[which]) {
     logged[which] = 1;
-    debugPrintf("[jni] getProperty -> %s\n",
-                which == 1 ? "24000" : which == 2 ? "256" : "(empty)");
+    debugPrintf("[jni] getProperty(%s) -> %s\n", key ? key : "(null)",
+                which == 1 ? NX_STR(PHI_FMOD_MIX_RATE)
+                           : which == 2 ? NX_STR(PHI_FMOD_MIX_FRAMES) : "(empty)");
   }
-  if (which == 1) return jni_make_string("24000");
-  if (which == 2) return jni_make_string("256");
+  if (which == 1) return jni_make_string(NX_STR(PHI_FMOD_MIX_RATE));
+  if (which == 2) return jni_make_string(NX_STR(PHI_FMOD_MIX_FRAMES));
   return jni_make_string("");
 }
 
