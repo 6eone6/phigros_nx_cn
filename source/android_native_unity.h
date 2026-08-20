@@ -64,4 +64,8 @@ long fakefd_read(int fd, void *buf, unsigned long n);
 long fakefd_write(int fd, const void *buf, unsigned long n);
 int  fakefd_close(int fd);
 
+/* Injected-event tallies: accepted vs refused by the engine. */
+void android_native_input_stats(unsigned *ok, unsigned *rejected,
+                                unsigned *carried, unsigned *saturated);
+
 #endif /* ANDROID_NATIVE_UNITY_H */

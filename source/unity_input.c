@@ -18,11 +18,25 @@ typedef struct {
   float xs [UI_MAX_POINTERS];
   float ys [UI_MAX_POINTERS];
   int   keycode;                /* KeyEvent                                 */
-  int64_t time_ms;
+  int64_t time_ms;              /* getEventTime: this event                 */
+  int64_t down_ms;              /* getDownTime: start of THIS gesture       */
 } UEvent;
 
-/* single reused handle -- injection is synchronous */
-static UEvent g_ev;
+/* Allocated from the SAME ring as obtain() copies, not a single static.
+ *
+ * This used to be one reused UEvent on the theory that "injection is
+ * synchronous". The obtain() note below says otherwise -- the engine reads its
+ * copy after inject returns -- and that only holds if obtain() is called for
+ * every event. If the engine ever reads the handle we passed directly, a single
+ * static has already been overwritten by the next event in the same frame.
+ * Handing out a ring slot costs nothing and removes the assumption. */
+static UEvent   g_ev_copies[UI_EVENT_COPIES];
+static unsigned g_ev_copy_i;
+
+static UEvent *ev_alloc(void){
+  const unsigned slot = __atomic_fetch_add(&g_ev_copy_i, 1u, __ATOMIC_RELAXED);
+  return &g_ev_copies[slot & UI_EVENT_COPY_MASK];
+}
 
 /* ---- touch diagnostics (see unity_input.h) ---- */
 int (*input_log_fn)(char *fmt, ...) = 0;
@@ -30,51 +44,60 @@ int   input_log_budget = 0;
 #define ILOG(...) do { if (input_log_fn && input_log_budget > 0) { \
                          input_log_budget--; input_log_fn(__VA_ARGS__); } } while (0)
 
+/* Event time, straight from the monotonic clock.
+ *
+ * An earlier revision forced this strictly increasing -- nudging by 1 ms when
+ * two events landed in the same millisecond -- on the theory that a consumer
+ * might de-duplicate by timestamp. Modelling it killed the idea: at ~28 events
+ * per frame that stamps 28 ms of time per 16.7 ms of wall clock, so eventTime
+ * ran 1.68x fast and was 106 ms ahead after eight frames of sustained tapping.
+ * For a rhythm game reading event times, drifting the clock during play is a
+ * far worse failure than the one it guarded against -- and the premise was
+ * weak anyway, since batched MotionEvents on real Android routinely share an
+ * eventTime. Left alone deliberately. */
 static int64_t now_ms(void){
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
   return (int64_t)ts.tv_sec*1000 + ts.tv_nsec/1000000;
 }
+
+/* Time of the current gesture's first ACTION_DOWN, for getDownTime(). Android
+ * reports the gesture start, not this event's time; returning the latter made
+ * every gesture look zero-length. */
+static int64_t g_gesture_down_ms = 0;
 static int  has(const char *s,const char *sub){ return strstr(s,sub)!=NULL; }
 static int  is_ev(void *p,int kind){ UEvent*e=p; return e && e->tag==UI_TAG && e->kind==kind; }
 
 /* ---- constructors ------------------------------------------------------- */
 void *unity_motionevent(int action,int count,const int *ids,const float *xs,const float *ys){
-  UEvent *e=&g_ev; memset(e,0,sizeof *e);
+  UEvent *e=ev_alloc(); memset(e,0,sizeof *e);
   e->tag=UI_TAG; e->kind=KIND_MOTION; e->action=action; e->time_ms=now_ms();
+  /* A bare ACTION_DOWN (not POINTER_DOWN) starts a new gesture. */
+  if ((action & AMOTION_ACTION_MASK) == AMOTION_ACTION_DOWN)
+    g_gesture_down_ms = e->time_ms;
+  e->down_ms = g_gesture_down_ms ? g_gesture_down_ms : e->time_ms;
   if (count>UI_MAX_POINTERS) count=UI_MAX_POINTERS;
   e->count=count;
   for (int i=0;i<count;i++){ e->ids[i]=ids?ids[i]:i; e->xs[i]=xs?xs[i]:0; e->ys[i]=ys?ys[i]:0; }
   return e;
 }
 void *unity_keyevent(int action,int keycode){
-  UEvent *e=&g_ev; memset(e,0,sizeof *e);
+  UEvent *e=ev_alloc(); memset(e,0,sizeof *e);
   e->tag=UI_TAG; e->kind=KIND_KEY; e->action=action; e->keycode=keycode; e->time_ms=now_ms();
+  e->down_ms = e->time_ms;
   return e;
 }
 
 /* MotionEvent.obtain(MotionEvent src): Android's copy factory. nativeInjectEvent
  * copies our injected event into one IT owns and reads that copy *after* inject
  * returns (across frames), so we must hand back a real, separate UEvent copy --
- * not g_ev, which the next frame overwrites. A small ring keeps several in-flight
- * copies alive until the engine finishes reading them. */
-/* Sized 32, not 16: the pointer layer can now emit several events in one frame
- * (a POINTER_DOWN, a batched MOVE and a POINTER_UP can all land together with
- * multitouch), so a 16-slot ring would recycle a copy after only four or five
- * frames instead of sixteen. 32 UEvents is a few KB. */
-/* 128, not 32: round 96 went from one cursor to two, and each emits its own
- * DOWN/MOVE/UP alongside real touch. That roughly tripled the events per
- * frame and put 32 slots back inside the "recycled after four or five
- * frames" window the note above warns about -- a copy the engine still holds
- * gets overwritten by a later event. 128 UEvents is about 15 KB. */
-static UEvent   g_ev_copies[128];
-static unsigned g_ev_copy_i;
+ * not the handle we were passed. Both the handle and the copy now come from the
+ * same ring (see ev_alloc), so either is safe to hold. */
 void *unity_motionevent_obtain(void *src){
   UEvent *s = src;
   if (!s || s->tag!=UI_TAG) return src;          /* not ours -> passthrough     */
-  /* atomic: obtain() is called from whichever thread the engine is running
-   * its input on, and two callers must never be handed the same slot. */
-  const unsigned slot = __atomic_fetch_add(&g_ev_copy_i, 1u, __ATOMIC_RELAXED);
-  UEvent *d = &g_ev_copies[slot & 127u];
+  /* Same ring, same atomic bump: obtain() runs on whichever thread the engine
+   * drives input from, and two callers must never receive the same slot. */
+  UEvent *d = ev_alloc();
   *d = *s;
   return d;
 }
@@ -126,7 +149,11 @@ uint64_t input_dispatch_int(void *recv, const void *id_, va_list va){ const stru
   /* shared InputEvent base */
   if (has(m,"getDeviceId")) return 0;
   if (has(m,"getSource"))   return (uint64_t)(e->kind==KIND_MOTION?AINPUT_SOURCE_TOUCHSCREEN:AINPUT_SOURCE_KEYBOARD);
-  if (has(m,"getEventTime")||has(m,"getDownTime")) return (uint64_t)e->time_ms; /* long */
+  /* Distinct: getDownTime is the gesture start, getEventTime is now. Checked in
+   * this order because "getDownTime" also contains "getDown"-like substrings
+   * and has() is a substring match. */
+  if (has(m,"getDownTime"))  return (uint64_t)e->down_ms;   /* long */
+  if (has(m,"getEventTime")) return (uint64_t)e->time_ms;   /* long */
   if (has(m,"getMetaState")) return 0;
   if (has(m,"getFlags"))     return 0;
 

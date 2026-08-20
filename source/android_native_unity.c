@@ -320,6 +320,19 @@ static int   g_live_id[NXG_MAX];
 static float g_live_x [NXG_MAX];
 static float g_live_y [NXG_MAX];
 static int   g_live_n = 0;
+static int   g_live_down_frame[NXG_MAX];   /* frame each live pointer went DOWN */
+static int   g_frame_no = 0;
+
+/* An UP held back so its DOWN gets a frame of its own -- see the note in
+ * android_native_feed_hid. Small: only pointers that went down and up inside a
+ * single frame land here, and each is released on the very next one. */
+static struct { int id; float x, y; } g_defer_up[NXG_MAX];
+static int   g_defer_n = 0;
+
+/* Events carried to the next frame because their pointer has already completed
+ * a DOWN this frame -- see the note in android_native_feed_hid. */
+static NxdpEvent g_carry[NXDP_MAX_EVENTS];
+static int       g_carry_n = 0;
 
 static int live_find(int id){
   for (int i = 0; i < g_live_n; i++)
@@ -327,10 +340,46 @@ static int live_find(int id){
   return -1;
 }
 
+/* Count rejected injections. nativeInjectEvent returns false when the engine
+ * declines an event -- a full input queue, or a state where it will not accept
+ * one -- and this used to be discarded, so a dropped tap left no trace at all
+ * and looked like a hardware or shim fault. */
+static unsigned g_inj_ok, g_inj_rejected;
+
+static unsigned g_carried_total;
+
+void android_native_input_stats(unsigned *ok, unsigned *rejected,
+                                unsigned *carried, unsigned *saturated){
+  if (ok) *ok = g_inj_ok;
+  if (rejected) *rejected = g_inj_rejected;
+  if (carried) *carried = g_carried_total;
+  if (saturated) *saturated = nxdp_touch_saturated();
+}
+
+static void live_remove(int idx){
+  for (int k = idx + 1; k < g_live_n; k++){
+    g_live_id[k-1]         = g_live_id[k];
+    g_live_x [k-1]         = g_live_x [k];
+    g_live_y [k-1]         = g_live_y [k];
+    g_live_down_frame[k-1] = g_live_down_frame[k];
+  }
+  g_live_n--;
+}
+
 static void emit(inject_fn inject, void *env, void *thiz, int action){
   if (g_live_n <= 0) return;
-  inject(env, thiz,
+  const uint8_t accepted = inject(env, thiz,
          unity_motionevent(action, g_live_n, g_live_id, g_live_x, g_live_y), 0);
+  if (accepted) g_inj_ok++;
+  else {
+    g_inj_rejected++;
+    static int warned = 0;
+    if (!warned) { warned = 1;
+      debugPrintf("[input] nativeInjectEvent REJECTED an event (action=0x%x). "
+                  "The engine is refusing input -- most likely its queue is "
+                  "full. Injected ok=%u rejected=%u\n",
+                  action, g_inj_ok, g_inj_rejected); }
+  }
 }
 
 void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
@@ -339,13 +388,39 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
    * cannot change under the module. */
   nxdp_update();
 
-  NxdpEvent ev[24];
-  const int n = nxdp_poll(ev, (int)(sizeof ev / sizeof ev[0]));
+  /* NXDP_MAX_EVENTS, not a literal: nxdp_poll returns min(available, max), so a
+   * short array here silently throws away the tail of the frame's input.
+   * Doubled so last frame's carry-over and this frame's events both fit. */
+  NxdpEvent ev[NXDP_MAX_EVENTS * 2];
+  int n = 0;
+  for (int c = 0; c < g_carry_n; c++) ev[n++] = g_carry[c];   /* carried first */
+  g_carry_n = 0;
+  n += nxdp_poll(ev + n, (int)(sizeof ev / sizeof ev[0]) - n);
 
   /* MOVEs are batched: several pointers can move in one frame, and Android
    * expresses that as ONE action with every pointer's new position, not one
    * event each. A DOWN or UP closes the batch. */
   int move_pending = 0;
+
+  /* Release any UP deferred from last frame FIRST.
+   *
+   * Do this before this frame's events, or a finger that lifts and lands again
+   * quickly would produce a DOWN while the old pointer is still live -- the
+   * "already down, treat as move" path below -- and the two taps would merge
+   * into one drag. */
+  for (int d = 0; d < g_defer_n; d++){
+    const int idx = live_find(g_defer_up[d].id);
+    if (idx < 0) continue;
+    g_live_x[idx] = g_defer_up[d].x;
+    g_live_y[idx] = g_defer_up[d].y;
+    emit(inject, env, thiz,
+         (g_live_n == 1)
+           ? AMOTION_ACTION_UP
+           : (AMOTION_ACTION_POINTER_UP | (idx << AMOTION_ACTION_PTR_IDX_SHIFT)));
+    live_remove(idx);
+  }
+  g_defer_n = 0;
+  g_frame_no++;
 
   for (int i = 0; i < n; i++){
     const int   id = ev[i].id;
@@ -365,6 +440,40 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
     }
 
     if (ev[i].phase == NXDP_DOWN){
+      /* A DOWN for a pointer whose UP is still deferred means this finger has
+       * tapped TWICE inside one frame (or a new finger took the slot the moment
+       * the old one left). Flush the held UP now, before the new DOWN.
+       *
+       * Without this the deferral swallows the second tap: live_find would
+       * still see the pointer, take the "already down" path below, and turn a
+       * fresh tap into a MOVE. Two taps in, one tap out -- the very bug the
+       * deferral exists to prevent, reintroduced from the other side. Draining
+       * the HID ring makes this reachable, because a frame now carries several
+       * samples rather than one. */
+      /* A DOWN for a pointer that has ALREADY completed a tap this frame means
+       * two taps landed inside one frame -- realistic in a dense chart, and
+       * reachable now that a frame carries many HID samples.
+       *
+       * An earlier revision flushed the first tap's held UP and let the second
+       * proceed. That kept both EVENTS but gave the first tap no frame of its
+       * own, so the game never saw that finger alive and the note scored
+       * nothing -- the same drop, one tap earlier.
+       *
+       * Instead, stop here and carry this event and everything after it to the
+       * next frame. The first tap keeps this frame; the second gets the next
+       * one. Order is preserved because the carry is replayed ahead of the new
+       * events, and it is self-limiting: the carried DOWN starts a fresh frame,
+       * so nothing accumulates. */
+      int deferred_here = 0;
+      for (int d = 0; d < g_defer_n; d++)
+        if (g_defer_up[d].id == id) { deferred_here = 1; break; }
+
+      if (deferred_here){
+        if (move_pending){ emit(inject, env, thiz, AMOTION_ACTION_MOVE); move_pending = 0; }
+        for (int k = i; k < n && g_carry_n < (int)(sizeof g_carry / sizeof g_carry[0]); k++)
+          { g_carry[g_carry_n++] = ev[k]; g_carried_total++; }
+        break;                                     /* rest of the frame waits */
+      }
       if (idx >= 0){                            /* already down -- treat as move */
         g_live_x[idx] = x; g_live_y[idx] = y;
         move_pending = 1;
@@ -373,6 +482,7 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
       if (g_live_n >= NXG_MAX) continue;        /* out of slots */
       idx = g_live_n++;
       g_live_id[idx] = id; g_live_x[idx] = x; g_live_y[idx] = y;
+      g_live_down_frame[idx] = g_frame_no;
       emit(inject, env, thiz,
            (g_live_n == 1)
              ? AMOTION_ACTION_DOWN
@@ -381,18 +491,41 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
     else if (ev[i].phase == NXDP_UP){
       if (idx < 0) continue;
       g_live_x[idx] = x; g_live_y[idx] = y;
+
+      /* If this pointer went DOWN in this same frame, hold its UP until the
+       * next one.
+       *
+       * The engine turns injected MotionEvents into its touch list before the
+       * game's next Update() runs. A DOWN and an UP delivered together
+       * therefore leave the game polling a touch that has already ended -- it
+       * never observes the finger arrive. Phigros judges on finger index
+       * (FingerManagement -> CheckNote(fingerIndex)), so such a tap is real,
+       * correctly delivered, and still scores nothing.
+       *
+       * Deferring the UP by one frame guarantees the finger is visible alive
+       * for at least one full frame, which is what every ordinary tap already
+       * gets. This has nothing to do with reading the HID ring: it bites any
+       * tap shorter than a frame and has been present since the first build.
+       * Draining the ring only made such taps reach this layer at all -- before
+       * that they were dropped even earlier.
+       *
+       * The cost is bounded and one-sided: the release is reported up to one
+       * frame late, and only for taps already shorter than a frame. Nothing is
+       * delayed that the game could otherwise have seen sooner. */
+      if (g_live_down_frame[idx] == g_frame_no && g_defer_n < NXG_MAX){
+        g_defer_up[g_defer_n].id = id;
+        g_defer_up[g_defer_n].x  = x;
+        g_defer_up[g_defer_n].y  = y;
+        g_defer_n++;
+        continue;                       /* stays live; released next frame */
+      }
       /* The lifting pointer is still IN the array for its own UP -- that is how
        * getActionIndex() identifies which one left. Remove it afterwards. */
       emit(inject, env, thiz,
            (g_live_n == 1)
              ? AMOTION_ACTION_UP
              : (AMOTION_ACTION_POINTER_UP | (idx << AMOTION_ACTION_PTR_IDX_SHIFT)));
-      for (int k = idx + 1; k < g_live_n; k++){
-        g_live_id[k-1] = g_live_id[k];
-        g_live_x [k-1] = g_live_x [k];
-        g_live_y [k-1] = g_live_y [k];
-      }
-      g_live_n--;
+      live_remove(idx);
     }
   }
 

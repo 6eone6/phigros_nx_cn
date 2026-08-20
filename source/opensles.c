@@ -302,7 +302,7 @@ static volatile uint32_t g_st_enq, g_st_consumed, g_st_dry, g_st_short, g_st_cb;
  * is no way to guess it from a log without this. peak is read-and-reset so each
  * line describes the interval since the last one. */
 static volatile unsigned g_cb_count, g_cb_peak;
-static unsigned g_created, g_destroyed, g_reclaimed, g_lim_hits;
+static unsigned g_created, g_destroyed, g_reclaimed, g_lim_hits, g_lim_bad_peak;
 static float    g_lim_gain = 1.0f;   /* limiter gain, see audio_callback */
 
 void phi_audio_stats(char *out, size_t cap) {
@@ -320,10 +320,10 @@ void phi_audio_stats(char *out, size_t cap) {
    * which is precisely why that leak took an extra round to spot.) */
   int n = snprintf(out, cap,
                    "enq=%u consumed=%u cb=%u dry=%u short=%u dev_cb=%u peak=%u "
-                   "dev=%dHz players=%u/%u/%u lim=%u/%.2f rates=",
+                   "dev=%dHz players=%u/%u/%u lim=%u/%.2f/bad%u rates=",
                    g_st_enq, g_st_consumed, g_st_cb, g_st_dry, g_st_short, cbs, peak,
                    g_dev_rate, g_created, g_destroyed, g_reclaimed,
-                   g_lim_hits, (double)g_lim_gain);
+                   g_lim_hits, (double)g_lim_gain, g_lim_bad_peak);
   if (n < 0) return;
   /* g_reg_lock is created by ensure_device, so it is NULL until the first
    * player exists -- and this is called every frame from the render thread,
@@ -588,12 +588,22 @@ static void SDLCALL audio_callback(void *ud, Uint8 *stream, int len) {
     const int32_t a = acc[i] < 0 ? -acc[i] : acc[i];
     if (a > raw) raw = a;
   }
+  const int32_t raw_reported = raw;   /* pre-clamp, for the stats line */
 #if PHI_AUDIO_LIMITER
-  const float need = (raw > PHI_AUDIO_LIMITER_CEILING)
-                     ? (float)PHI_AUDIO_LIMITER_CEILING / (float)raw : 1.0f;
+  /* A peak far beyond anything real programme material can produce is bad data,
+   * not loud audio. Do not let it drive the gain at all -- clipping that block
+   * costs one click; believing it costs the whole mix (see config.h). */
+  if (raw > PHI_AUDIO_LIMITER_SANE_PEAK) {
+    g_lim_bad_peak++;
+    raw = PHI_AUDIO_LIMITER_CEILING;      /* treat as "at the ceiling" */
+  }
+  float need = (raw > PHI_AUDIO_LIMITER_CEILING)
+               ? (float)PHI_AUDIO_LIMITER_CEILING / (float)raw : 1.0f;
+  if (need < PHI_AUDIO_LIMITER_FLOOR) need = PHI_AUDIO_LIMITER_FLOOR;
   if (need < g_lim_gain) { g_lim_gain = need; g_lim_hits++; }  /* attack: instant */
   else g_lim_gain += (need - g_lim_gain) * PHI_AUDIO_LIMITER_RELEASE;
   if (g_lim_gain > 1.0f) g_lim_gain = 1.0f;
+  if (g_lim_gain < PHI_AUDIO_LIMITER_FLOOR) g_lim_gain = PHI_AUDIO_LIMITER_FLOOR;
 #else
   g_lim_gain = 1.0f;   /* hard clip, as before */
 #endif
@@ -603,7 +613,7 @@ static void SDLCALL audio_callback(void *ud, Uint8 *stream, int len) {
    * of what we write. Post-limiter output can never exceed the ceiling, so
    * reporting it would show a healthy number by construction and blind the one
    * diagnostic that identified the clipping in the first place. */
-  const int32_t peak = raw;
+  const int32_t peak = raw_reported;
   for (int i = 0; i < frames * 2; i++) {
     int32_t v = (int32_t)((float)acc[i] * g_lim_gain);
     if (v > 32767) v = 32767;
@@ -1232,18 +1242,42 @@ static SLresult eng_CreateAudioPlayer(void *self, SLObjectItf *pPlayer, SLDataSo
     // been playing-but-silent for >~0.8s (a live BGM re-enqueues far sooner, so
     // it never becomes a victim). Safe to free here -- the mixer holds g_reg_lock
     // while mixing, so it can't touch the victim concurrently.
+    /* Take the MOST idle candidate, not the first one that qualifies.
+     *
+     * First-match is arbitrary: at index 0 sits the oldest player, which is
+     * typically FMOD's output stream. If that stream is merely stalled -- and
+     * these logs show GC pauses and multi-second futex waits -- it looks
+     * "playing but silent" exactly like an abandoned one, and freeing it while
+     * FMOD still holds the pointer silences the game for the rest of the
+     * session. Choosing the longest-idle victim makes a genuinely dead player
+     * strictly more likely to be picked than a briefly stalled live one. */
+    int best = -1;
+    unsigned best_drained = 40;            /* must beat the threshold */
     for (int i = 0; i < g_player_count; i++) {
       Player *q = g_players[i];
-      if (q && q->playing && q->drained > 40) {
-        g_players[i] = NULL;
-        if (q->lock) SDL_DestroyMutex(q->lock);
-        bq_free_slots(q);   /* or one block per slot leaks, forever */
-        free(q);
-        g_reclaimed++;
-        slot = i;
-        break;
+      if (q && q->playing && (unsigned)q->drained > best_drained) {
+        best = i; best_drained = (unsigned)q->drained;
       }
     }
+    if (best >= 0) {
+      Player *q = g_players[best];
+      g_players[best] = NULL;
+      if (q->lock) SDL_DestroyMutex(q->lock);
+      bq_free_slots(q);   /* or one block per slot leaks, forever */
+      free(q);
+      g_reclaimed++;
+      slot = best;
+    }
+    /* Reaching here at all means players are being created and never
+     * Destroyed -- measured at 6-8 FMOD output players per run. Say so: a pool
+     * that fills is the precondition for recycling a live stream, which is
+     * heard as the game going silent. */
+    { static int warned = 0;
+      if (!warned) { warned = 1;
+        debugPrintf("[fmod] OpenSL player pool FULL (%d). created=%u destroyed=%u "
+                    "reclaimed=%u -- recycling the longest-idle player. If audio "
+                    "cuts out around here, this is why.\n",
+                    MAX_PLAYERS, g_created, g_destroyed, g_reclaimed); } }
   }
   if (slot >= 0)
     g_players[slot] = p;

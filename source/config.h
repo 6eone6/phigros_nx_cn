@@ -189,6 +189,29 @@
  * finger, which docked mode cannot use anyway. */
 #define PHI_TOUCH_SLOTS 10
 
+/* ---- input sampling -------------------------------------------------------
+ * How many touchscreen samples to drain from the HID ring each frame.
+ *
+ * The panel is sampled by the system faster than we render, and the ring keeps
+ * a short history. Reading only the newest entry -- which is what
+ * hidGetTouchScreenStates(&ts, 1) does -- throws that history away, so a tap
+ * that starts and ends between two frames produces no DOWN and no UP at all
+ * and the note is never registered. Draining the ring replays them in order.
+ *
+ * 16, not 8. The window has to cover the LONGEST frame, not the average one,
+ * and these logs show GC bailouts and multi-second stalls. A 100 ms frame needs
+ * 12 samples at a 120 Hz panel and 25 at 250 Hz, so 8 was quietly losing input
+ * during exactly the hitches where a player is most likely to notice a dropped
+ * note. libnx's touchscreen ring holds 17 entries, so 16 takes essentially all
+ * of it and there is nothing further to gain by going higher.
+ *
+ * Cost is small and bounded: a static array in do_touch, a larger event queue
+ * (sized from this automatically), and more injected events only when the panel
+ * actually produced them. The [input] line reports "sat=" -- the number of
+ * frames that read the ring completely full, meaning samples MAY have been lost
+ * and this is too low. It should stay at 0. */
+#define PHI_INPUT_STATES 16
+
 /* ---- virtual cursor: REMOVED --------------------------------------------
  * The two stick-driven cursors are gone. Phigros judges on finger index, so a
  * pair of analogue cursors could never play it -- they existed only so DOCKED
@@ -340,6 +363,24 @@
 #define PHI_AUDIO_LIMITER         1
 #define PHI_AUDIO_LIMITER_CEILING 32700
 #define PHI_AUDIO_LIMITER_RELEASE 0.02f
+
+/* Floor on the limiter's gain: it may never duck the mix below this.
+ *
+ * The limiter is a GLOBAL gain, so without a floor one corrupt sample -- a
+ * player reading stale memory, a mis-parsed block -- sets gain = CEILING/raw
+ * and mutes EVERYTHING. At raw = 1e6 that is 0.03, and it takes seconds to
+ * recover; if the garbage repeats, it never does. The mixer keeps running and
+ * every counter still looks healthy, so it presents as the game suddenly going
+ * silent for no reason.
+ *
+ * 0.25 is -12 dB, far more range than real programme material needs (the
+ * measured worst case was 43000 against a 32700 ceiling, i.e. 0.76). Anything
+ * demanding more than this is not loud music, it is bad data -- and clipping a
+ * bad block for one callback is a click, whereas muting the game is the end of
+ * the session. PHI_AUDIO_LIMITER_SANE_PEAK is the matching guard: a peak beyond
+ * it is not believed at all. */
+#define PHI_AUDIO_LIMITER_FLOOR     0.25f
+#define PHI_AUDIO_LIMITER_SANE_PEAK (32767 * 8)
 
 #include "nx_root.h"   /* nx_root(), nx_rp() -- DATA_ROOT/GAME_HOME are these */
 

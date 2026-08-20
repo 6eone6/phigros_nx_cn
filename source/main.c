@@ -2076,7 +2076,10 @@ int main(int argc, char *argv[]) {
        *   dry / short high -> the queue runs empty (underrun) */
       char ast[512];   /* 96 truncated the rate list and hid a player leak */
       phi_audio_stats(ast, sizeof ast);
-      debugPrintf("[boot] frame %d rendered  [audio] %s\n", frame, ast);
+      unsigned iok = 0, irej = 0, icar = 0, isat = 0;
+      android_native_input_stats(&iok, &irej, &icar, &isat);
+      debugPrintf("[boot] frame %d rendered  [input] inj=%u rej=%u carry=%u sat=%u  "
+                  "[audio] %s\n", frame, iok, irej, icar, isat, ast);
     }
 #if PHI_HAVE_FINISH_PROBE
     if (frame == 90 || frame == 300 || frame == 600 || frame == 1200)

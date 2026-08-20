@@ -32,7 +32,59 @@
  * all 10 go to real fingers (ids 0..9) and the two stick cursors move up to
  * 10 and 11 -- hence 12 here, so a full 10-finger chord plus both cursors never
  * gets clamped. Fruit Ninja could afford 8+2 within 10; this game cannot. */
+#include "config.h"   /* PHI_TOUCH_SLOTS */
+
 #define UI_MAX_POINTERS 12
+
+/* ---- injected-event copy ring --------------------------------------------
+ * The engine copies an injected event via MotionEvent.obtain() and reads that
+ * copy AFTER inject() returns, across frames -- so a copy it is still holding
+ * must not be recycled underneath it. The ring has been raised twice already
+ * (16 -> 32 -> 128) each time the events-per-frame count went up, and draining
+ * the HID ring raised it again: taps that used to be invisible now each produce
+ * a real DOWN and UP.
+ *
+ * Sized from the worst case instead of guessed. Carry-over limits a pointer to
+ * one completed tap per frame, so per frame the engine can receive at most one
+ * DOWN and one UP per slot, plus a few batched MOVEs:
+ *
+ *     UI_INJECT_PER_FRAME = 2 * PHI_TOUCH_SLOTS + 8
+ *
+ * and it must survive being held for several frames. 16 frames of headroom
+ * matches what the 16-slot note originally considered safe.
+ *
+ * Must be a power of two: the index is masked, and the mask is derived here
+ * rather than written out -- it used to be a hardcoded `& 127u`, so resizing
+ * the array alone would silently have kept using 128 slots. */
+#define UI_INJECT_PER_FRAME (2 * PHI_TOUCH_SLOTS + 8)
+
+/* TWO slots per injected event, not one:
+ *     unity_motionevent()        takes a slot for the handle we hand over
+ *     unity_motionevent_obtain() takes another for the engine's own copy
+ * The handle only started coming from this ring when the single static was
+ * removed, and the first version of this sizing still assumed one slot each --
+ * so the guard below computed half the bound it needed and would have accepted
+ * a ring with 9 frames of headroom, inside the window this file warns about.
+ * Counted explicitly here so the factor cannot be dropped again. */
+#define UI_SLOTS_PER_EVENT  2
+#define UI_EVENT_HOLD_FRAMES 16
+#define UI_EVENT_COPIES     1024
+#define UI_EVENT_COPY_MASK  (UI_EVENT_COPIES - 1)
+
+#if (UI_EVENT_COPIES & UI_EVENT_COPY_MASK) != 0
+#error "UI_EVENT_COPIES must be a power of two: the ring index is masked with UI_EVENT_COPY_MASK."
+#endif
+#if UI_EVENT_COPIES < (UI_INJECT_PER_FRAME * UI_SLOTS_PER_EVENT * UI_EVENT_HOLD_FRAMES)
+#error "UI_EVENT_COPIES too small: an event copy the engine is still reading would be recycled within a few frames. Note each injected event consumes UI_SLOTS_PER_EVENT slots. Raise it, or lower PHI_TOUCH_SLOTS."
+#endif
+
+/* The live-pointer pool (NXG_MAX in android_native_unity.c) is this, and a DOWN
+ * that finds it full is dropped silently. It must hold every finger plus both
+ * cursors, or the last finger of a full chord vanishes with nothing in the log
+ * -- which for a finger-indexed rhythm game is an unexplained missed note. */
+#if UI_MAX_POINTERS < (PHI_TOUCH_SLOTS + 2)
+#error "UI_MAX_POINTERS must be at least PHI_TOUCH_SLOTS + 2 (fingers + both cursors), or a DOWN is dropped when the pool fills."
+#endif
 
 /* Android action / source / keycode constants */
 #define AMOTION_ACTION_DOWN          0

@@ -19,6 +19,7 @@
 #include <setjmp.h>
 #include <png.h>
 
+#include "config.h"
 #include "nx_dual_pointer.h"
 
 /* This port is touch + controller only. The original module's USB-mouse code is
@@ -65,6 +66,14 @@ static int   s_handle_touch = 0;
 
 /* touch (handheld), only used when s_handle_touch != 0 */
 static int   s_touch_active[16];
+/* Panel finger_id occupying each slot, or NO_FID when the slot is free.
+ * Slots are OUR pointer ids; finger_id is the panel's stable identity for a
+ * contact. Keeping the mapping is what stops ids being reused -- see
+ * do_touch_state. */
+#define NO_FID 0xFFFFFFFFu
+static unsigned s_touch_saturated = 0;
+unsigned nxdp_touch_saturated(void){ return s_touch_saturated; }
+static uint32_t s_touch_fid[16];
 static int   s_touch_slots = 8;       /* real fingers tracked; see max_touch_slots */
 static float s_touch_x[16], s_touch_y[16];
 
@@ -112,7 +121,10 @@ static u64 s_settings_tick  = 0;
 static int s_dpad_hold = 0;
 
 /* events emitted this frame */
-static NxdpEvent s_ev[32];
+/* Sized for PHI_INPUT_STATES HID samples rather than one: each sample can emit
+ * up to PHI_TOUCH_SLOTS events, and dropping events silently at the end of a
+ * frame is exactly the failure this change exists to remove. */
+static NxdpEvent s_ev[NXDP_MAX_EVENTS];
 static int       s_nev;
 
 /* ------------------------------------------------------- settings file ---
@@ -390,7 +402,13 @@ static void clamp_cursor(int c) {
 }
 
 static void push(int id, float x, float y, int phase) {
-  if (s_nev >= (int)(sizeof s_ev / sizeof s_ev[0])) return;
+  if (s_nev >= (int)(sizeof s_ev / sizeof s_ev[0])) {
+    static int warned = 0;
+    if (!warned) { warned = 1;
+      logf_("nxdp: event queue full (%d) -- input is being DROPPED; raise "
+            "PHI_INPUT_STATES headroom\n", s_nev); }
+    return;
+  }
   NxdpEvent *e = &s_ev[s_nev++];
   e->id = id; e->x = x; e->y = y; e->phase = phase;
 }
@@ -413,19 +431,49 @@ static int ctrl_rot(void) {
   return (s_rotation && padIsHandheld(&s_pad)) ? s_rotation : 0;
 }
 
-static void do_touch(void) {
-  if (!s_handle_touch) return;
-  HidTouchScreenState ts = {0};
-  hidGetTouchScreenStates(&ts, 1);
-
+/* Process ONE touchscreen sample. Split out of do_touch so the ring below can
+ * replay every sample the system captured since the last frame. */
+static void do_touch_state(const HidTouchScreenState *tsp) {
+  const HidTouchScreenState ts = *tsp;
   const int slots = s_touch_slots;    /* fingers get ids 0..slots-1 */
   int now[16] = {0};
-  int count = ts.count > slots ? slots : ts.count;
+  /* Scan every reported contact, not just the first `slots` of them. Slot
+   * allocation caps how many we track; truncating the ARRAY instead would drop
+   * a finger we are already tracking just because the panel happened to list it
+   * late, which loses its UP and strands the slot. Already-tracked fingers
+   * match by finger_id and need no free slot, so scan order cannot starve them. */
+  int count = ts.count;
+  if (count > (int)(sizeof ts.touches / sizeof ts.touches[0]))
+    count = (int)(sizeof ts.touches / sizeof ts.touches[0]);
 
   const float sw = (float)s_cfg.screen_w, sh = (float)s_cfg.screen_h;
   const float pw = (float)s_cfg.panel_w,  ph = (float)s_cfg.panel_h;
 
+  /* Identity comes from the panel's finger_id, NOT the array index.
+   *
+   * HID packs live contacts into a dense array, so lifting a finger re-packs
+   * the ones after it. Keying identity on the index therefore turns
+   *     index 0 = finger A (x=200), index 1 = finger B (x=900)
+   * into, the moment A lifts,
+   *     index 0 = finger B (x=900)
+   * and the old code emitted MOVE id=0 from 200 to 900 -- one finger appearing
+   * to slide across the screen. No UP for A, no DOWN for B. That is exactly
+   * "the first input takes a long time to release", "the next input is treated
+   * as the first one", and a settings slider leaping to the right.
+   *
+   * finger_id is stable for the life of a contact, so a slot holds one finger
+   * from DOWN to UP no matter how the array is re-packed under it. */
   for (int i = 0; i < count; i++) {
+    const uint32_t fid = ts.touches[i].finger_id;
+
+    int slot = -1;
+    for (int k = 0; k < slots; k++)                 /* already tracking it? */
+      if (s_touch_active[k] && s_touch_fid[k] == fid) { slot = k; break; }
+    if (slot < 0)
+      for (int k = 0; k < slots; k++)               /* else take a free slot */
+        if (!s_touch_active[k] && !now[k]) { slot = k; break; }
+    if (slot < 0) continue;                         /* more fingers than slots */
+
     float px = (float)ts.touches[i].x, py = (float)ts.touches[i].y;
     float x, y;
     if      (s_rotation == 1) { x =        py * (sw/ph); y = (pw-px) * (sh/pw); }
@@ -435,15 +483,99 @@ static void do_touch(void) {
     if (y < 0) y = 0;
     if (x > sw - 1) x = sw - 1;
     if (y > sh - 1) y = sh - 1;
-    now[i] = 1;
-    /* real fingers keep their own small ids (0..n), distinct from cursor ids */
-    push(i, x, y, s_touch_active[i] ? NXDP_MOVE : NXDP_DOWN);
-    s_touch_x[i] = x; s_touch_y[i] = y;
+
+    now[slot] = 1;
+    /* DOWN always; MOVE only if the finger actually moved.
+     *
+     * Draining the HID ring means a resting finger is reported once per SAMPLE,
+     * not once per frame, and without this every one of those samples became a
+     * MotionEvent saying "it moved to exactly where it already was" -- up to
+     * PHI_INPUT_STATES * PHI_TOUCH_SLOTS of them per frame. Unity's injection
+     * queue is finite and emit() discards the return value, so redundant MOVEs
+     * can crowd out real DOWN/UP events and the loss is invisible. Suppressing
+     * them keeps every meaningful event and removes the flood the ring drain
+     * would otherwise produce.
+     *
+     * Exact compare, not an epsilon: the panel reports integer coordinates and
+     * these are a fixed scale of them, so an unmoved finger is bit-identical.
+     * A real 1-pixel move still gets through. */
+    const int moved = (x != s_touch_x[slot]) || (y != s_touch_y[slot]);
+    if (!s_touch_active[slot])   push(slot, x, y, NXDP_DOWN);
+    else if (moved)              push(slot, x, y, NXDP_MOVE);
+    s_touch_x[slot] = x; s_touch_y[slot] = y;
+    s_touch_fid[slot] = fid;
+    s_touch_active[slot] = 1;      /* set here so a later finger cannot take it */
   }
   for (int i = 0; i < slots; i++) {
-    if (s_touch_active[i] && !now[i])
+    if (s_touch_active[i] && !now[i]) {
       push(i, s_touch_x[i], s_touch_y[i], NXDP_UP);
+      s_touch_fid[i] = NO_FID;     /* slot is free for a genuinely new finger */
+    }
     s_touch_active[i] = now[i];
+  }
+}
+
+/* Replay EVERY touchscreen sample captured since the last frame.
+ *
+ * This used to read one state -- hidGetTouchScreenStates(&ts, 1) -- which
+ * returns only the newest entry in the system's HID ring. Everything the panel
+ * captured between two frames was discarded, and that has two costs for a
+ * rhythm game:
+ *
+ *   - A tap that begins AND ends inside one frame interval vanishes entirely.
+ *     Not late, not jittery: no DOWN and no UP are ever generated, so the note
+ *     is simply not registered. Fast taps are exactly what this game is made of.
+ *   - Surviving touches are quantised to frame boundaries, so their timing
+ *     carries up to a frame of jitter into a judgement window measured in
+ *     milliseconds.
+ *
+ * The ring is read newest-first, so it is walked BACKWARDS to replay the
+ * samples in the order they happened, and sampling_number is used to skip any
+ * we have already handled -- the ring is not consumed by reading it, so
+ * without that check every frame would replay the same samples and synthesise
+ * phantom taps. */
+static void do_touch(void) {
+  if (!s_handle_touch) return;
+  static HidTouchScreenState st[PHI_INPUT_STATES];
+  static u64 s_last_sample = 0;
+
+  const int n = (int)hidGetTouchScreenStates(st, PHI_INPUT_STATES);
+  if (n <= 0) return;
+  /* A completely full read means the ring had at least as many entries as we
+   * asked for, so older ones may already have been overwritten -- i.e. input
+   * we never saw. Counting it is the only way to know PHI_INPUT_STATES is big
+   * enough, and a silent loss here looks exactly like a hardware drop. */
+  if (n >= PHI_INPUT_STATES) s_touch_saturated++;
+
+  /* PRIME on the first call: the ring is system-owned and already holds samples
+   * from before this process existed -- touches on the HOME menu, or on the
+   * hbmenu entry that launched us. Replaying those would inject a phantom tap
+   * into the game's first frames, which for a rhythm game is a stray note, and
+   * would look exactly like the input bug this change is meant to fix. Adopt
+   * the newest sampling_number and start from there. */
+  static int primed = 0;
+  if (!primed) {
+    primed = 1;
+    s_last_sample = st[0].sampling_number;
+    return;
+  }
+
+  int fresh = 0;
+  for (int i = n - 1; i >= 0; i--) {          /* oldest -> newest */
+    if (st[i].sampling_number <= s_last_sample) continue;
+    do_touch_state(&st[i]);
+    fresh++;
+  }
+  if (n > 0 && st[0].sampling_number > s_last_sample)
+    s_last_sample = st[0].sampling_number;
+
+  if (fresh > 1) {                            /* how much we used to throw away */
+    static unsigned extra = 0, reported = 0;
+    extra += (unsigned)(fresh - 1);
+    if (extra - reported >= 600) { reported = extra;
+      logf_("nxdp: replayed %u extra touch samples so far (these were being "
+            "dropped before; each one is a tap or a position we never saw)\n",
+            extra); }
   }
 }
 

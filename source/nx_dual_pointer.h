@@ -45,6 +45,35 @@
 #ifndef NX_DUAL_POINTER_H
 #define NX_DUAL_POINTER_H
 
+/* Event-queue capacity, shared by the producer (nx_dual_pointer.c) and every
+ * consumer, so the two cannot be sized differently.
+ *
+ * They were: the producer queue was raised to hold a whole HID ring's worth of
+ * samples while the caller still passed a 24-entry array, and nxdp_poll copies
+ * min(available, max) -- so everything past 24 was discarded without a word.
+ * That is precisely the silent input loss draining the ring exists to fix,
+ * moved one layer up. Derive it once, in the header both sides include. */
+#include "config.h"   /* PHI_INPUT_STATES, PHI_TOUCH_SLOTS */
+
+#define NXDP_MAX_EVENTS ((PHI_INPUT_STATES + 1) * (PHI_TOUCH_SLOTS + 4))
+
+/* Prove the queue cannot overflow, rather than hoping a runtime warning is
+ * noticed. It would not be: the warning goes through the module's log hook,
+ * which is debugPrintf, which is compiled out at DEBUG_LOG 0 -- so in a release
+ * build a queue overflow would drop input in total silence.
+ *
+ * Bound: do_touch_state pushes at most one event per SLOT per state (a finger
+ * is either present, giving DOWN/MOVE, or newly absent, giving UP -- never
+ * both), so the worst case is PHI_INPUT_STATES * PHI_TOUCH_SLOTS, plus a
+ * little for the D-pad/back and the cursors if they are ever re-enabled. */
+#if NXDP_MAX_EVENTS < (PHI_INPUT_STATES * PHI_TOUCH_SLOTS + 8)
+#error "NXDP_MAX_EVENTS too small: a frame could produce more input events than the queue holds, and they would be dropped silently. Raise it or lower PHI_INPUT_STATES."
+/* Frames whose HID read came back completely full -- samples may have been
+ * lost before we read them. Should stay 0; if it climbs, raise PHI_INPUT_STATES. */
+unsigned nxdp_touch_saturated(void);
+
+#endif
+
 #include <stdint.h>
 #include <stdio.h>   /* FILE, for the optional locked-I/O hooks */
 
@@ -135,5 +164,9 @@ int   nxdp_tapping_fingers(NxdpFinger *out, int max);
 
 /* Flush any pending settings write now (e.g. on shutdown). */
 void  nxdp_save_settings(void);
+
+/* Frames whose HID read came back completely full -- samples may have been
+ * lost before we read them. Should stay 0; if it climbs, raise PHI_INPUT_STATES. */
+unsigned nxdp_touch_saturated(void);
 
 #endif /* NX_DUAL_POINTER_H */
