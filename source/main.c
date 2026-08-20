@@ -37,6 +37,7 @@
 #include "so_util.h"
 #include "imports.h"
 #include "jni_fake.h"
+#include "unity_jni.h"        /* unity_prefs_tick / unity_prefs_sync */
 #include "android_native_unity.h"
 #include "opensles.h"
 #include "unity_entrypoints.h"
@@ -774,6 +775,72 @@ static void check_data(int mounted) {
                   r->path, (unsigned long long)have, (unsigned long long)r->size);
   }
 
+#if PHI_ASSET_PACK
+  /* Whole-pack sanity: one number that catches a partial copy ANYWHERE, before
+   * the two targeted counts below say which part. A real report showed 2572
+   * entries against an expected 2958 -- the shortfall was entirely bin/Data,
+   * but the total is what makes "something is missing" obvious at a glance in
+   * a log, and it is one integer. */
+  if (mounted) {
+    const size_t n = asset_pack_entry_count();
+    if (n && n != (size_t)PHI_ASSET_FILE_COUNT)
+      debugPrintf("[assets] pack holds %zu entries; reference copy has %d "
+                  "(%s)\n", n, PHI_ASSET_FILE_COUNT,
+                  n < (size_t)PHI_ASSET_FILE_COUNT ? "INCOMPLETE COPY?"
+                                                   : "different game version?");
+  }
+#endif
+
+  /* ---- engine data inventory --------------------------------------------
+   * The bundle check below counts SONGS. This counts the engine's own data --
+   * scenes, resources, metadata under assets/bin/Data. They fail differently:
+   * missing bundles means missing content, missing bin/Data means the engine
+   * has nothing to build a scene FROM, so it renders an empty frame forever.
+   * That is a black screen with a perfectly healthy render loop, and it is
+   * indistinguishable from a port bug unless something counts the files.
+   *
+   * A real report had 55 of 441 here while all 2514 bundles were present, and
+   * the loader booted happily into a black screen: the required-files list
+   * above only names a handful of entry points, and every one of them happened
+   * to be in the 55. Counting is what catches a partial copy. */
+  {
+    unsigned nd = 0;
+    const char *src = "loose tree";
+#if PHI_ASSET_PACK
+    if (mounted) {
+      src = "pack";
+      void *pd = asset_pack_opendir_path("assets/bin/Data");
+      if (pd) {
+        while (asset_pack_readdir_path(pd, NULL, NULL) != NULL) nd++;
+        asset_pack_closedir_path(pd);
+      }
+    }
+#endif
+    if (nd == 0) {
+      snprintf(path, sizeof path, "%s/assets/bin/Data", DATA_ROOT);
+      DIR *d = opendir(path);
+      if (d) { struct dirent *e; src = "loose tree";
+        while ((e = readdir(d)) != NULL) if (e->d_name[0] != '.') nd++;
+        closedir(d); }
+    }
+    /* Fatal below half, because that is not a version difference -- it is an
+     * incomplete copy, and every symptom it produces looks like a port bug. */
+    if (nd * 2 < (unsigned)PHI_ASSET_DATA_COUNT)
+      fatal_error("Incomplete game data.\n\n"
+                  "assets/bin/Data has %u files; this build expects about %d.\n"
+                  "All %d song bundles are fine -- it is the engine data that is\n"
+                  "missing, so the game would boot to a BLACK SCREEN.\n\n"
+                  "Re-copy the whole assets/ folder out of your APK, then delete\n"
+                  "assets.nxpack and assets.nxpack.idx so it is rebuilt.\n"
+                  "(counted via: %s)",
+                  nd, PHI_ASSET_DATA_COUNT, PHI_AA_BUNDLE_COUNT, src);
+    if (nd != (unsigned)PHI_ASSET_DATA_COUNT)
+      debugPrintf("[assets] bin/Data has %u files, reference copy has %d "
+                  "(different game version? not fatal)\n", nd, PHI_ASSET_DATA_COUNT);
+    else
+      debugPrintf("[assets] bin/Data %u/%d files (%s)\n", nd, PHI_ASSET_DATA_COUNT, src);
+  }
+
   /* ---- Addressables bundle inventory ------------------------------------
    * The catalog references PHI_AA_BUNDLE_COUNT bundles and every one of them
    * was present in the reference copy -- 0 missing, 0 extra. So a short count
@@ -1132,7 +1199,18 @@ int main(int argc, char *argv[]) {
   nx_root_init(argc, argv);
   (void)argc; (void)argv;
   socketInitializeDefault();
-  debugPrintf("[boot] === phigros_nx start (region64mb build) ===\n");
+  /* debug.log is opened O_APPEND, so one file can hold several runs. Say so at
+   * the top of each: a log with two boots in it looks like one run that created
+   * twice as many of everything, and that misread cost real time once already. */
+  /* Stamp the source revision and build time. Three logs in a row turned out to
+   * be the same stale file from an older .nro, which is invisible unless the
+   * build says who it is. __DATE__/__TIME__ change on every rebuild, so two
+   * logs from "the same build" that disagree here are not the same build. */
+  debugPrintf("\n[boot] ======== phigros_nx start (region64mb) ========\n"
+              "[boot] rev %s  built %s %s\n"
+              "[boot] (debug.log APPENDS -- more than one banner means the file "
+              "holds multiple runs)\n",
+              PHI_SRC_REV, __DATE__, __TIME__);
 
   /* Load config.txt. When the file is
    * missing, autogenerate a documented one with the defaults; when it holds
@@ -1985,6 +2063,10 @@ int main(int argc, char *argv[]) {
       nx_boot_il2cpp_hacks();
 #endif
     }
+    /* Deferred PlayerPrefs write-back. Costs a tick compare per frame and turns
+     * a burst of apply() calls into one file write instead of one each. */
+    unity_prefs_tick();
+
     if (frame < 5 || (frame % 120) == 0) {
       /* Audio counters alongside the frame counter. Printed HERE, on the main
        * thread, because the audio callback must never touch the log -- file I/O
@@ -1992,7 +2074,7 @@ int main(int argc, char *argv[]) {
        * numbers separate the two failure shapes without another guess:
        *   consumed >> enq  -> blocks replayed (aliasing)
        *   dry / short high -> the queue runs empty (underrun) */
-      char ast[96];
+      char ast[512];   /* 96 truncated the rate list and hid a player leak */
       phi_audio_stats(ast, sizeof ast);
       debugPrintf("[boot] frame %d rendered  [audio] %s\n", frame, ast);
     }
@@ -2007,6 +2089,11 @@ int main(int argc, char *argv[]) {
    * normally debounces its own save, so quitting quickly after a D-pad tweak
    * would otherwise lose it. */
   android_native_input_shutdown();
+
+  /* Land any deferred apply() BEFORE the engine tears down. A deferred write
+   * that is never flushed is a lost save, which is a far worse bug than the
+   * slow writes the deferral fixes. */
+  unity_prefs_sync();
 
   Unity_nativeApplicationUnload(fake_env, fake_unityplayer_thiz);
   Unity_nativeDone(fake_env, fake_unityplayer_thiz);

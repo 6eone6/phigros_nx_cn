@@ -115,6 +115,7 @@ static const char *managed_root(void){
  * ========================================================================== */
 typedef struct { char type; char *key; char *val; } KV;
 static KV   *g_kv = NULL; static int g_kv_n=0, g_kv_cap=0; static int g_kv_dirty=0;
+static int g_kv_flush_delay = 0;   /* frames remaining before a deferred apply lands */
 
 static char *prefs_file(char *buf,size_t n){ snprintf(buf,n,"%s/prefs.kv",g_root); return buf; }
 
@@ -151,15 +152,57 @@ static void prefs_load(void){
   fclose(f); g_kv_dirty=0;
   debugPrintf("[prefs] load: %d entries from %s\n", g_kv_n, p);
 }
+/* Write via a temp file and rename, so a power-off mid-write cannot leave a
+ * half-written save. The reported prefs.kv ended in a torn line for exactly
+ * that reason: the file is rewritten whole, hundreds of times, so the odds of
+ * being interrupted inside one of those writes are not small. A rename is
+ * atomic, so the old save survives intact until the new one is complete. */
 static void prefs_flush(void){
   if(!g_kv_dirty){ debugPrintf("[prefs] flush: nothing dirty (%d entries)\n", g_kv_n); return; }
-  char p[256]; FILE*f=fopen(prefs_file(p,sizeof p),"wb");
-  if(!f){ debugPrintf("[prefs] flush FAILED: fopen(%s,wb) errno=%d\n", p, errno); return; }
+  char p[256], tmp[288];
+  prefs_file(p,sizeof p);
+  snprintf(tmp,sizeof tmp,"%s.tmp",p);
+  FILE*f=fopen(tmp,"wb");
+  if(!f){ debugPrintf("[prefs] flush FAILED: fopen(%s,wb) errno=%d\n", tmp, errno); return; }
   for(int i=0;i<g_kv_n;i++){ fputc(g_kv[i].type,f); fputc('\t',f);
     esc(f,g_kv[i].key); fputc('\t',f); esc(f,g_kv[i].val); fputc('\n',f); }
-  fclose(f); g_kv_dirty=0;
+  const int werr = ferror(f);
+  if (fclose(f) != 0 || werr) {
+    debugPrintf("[prefs] flush FAILED while writing %s -- save left untouched\n", tmp);
+    remove(tmp); return;
+  }
+  remove(p);                       /* FAT rename does not replace */
+  if (rename(tmp,p) != 0) {
+    debugPrintf("[prefs] flush FAILED: rename(%s->%s) errno=%d\n", tmp, p, errno);
+    return;
+  }
+  g_kv_dirty=0; g_kv_flush_delay=0;
   debugPrintf("[prefs] flush: wrote %d entries to %s\n", g_kv_n, p);
 }
+
+/* Android's Editor.apply() is ASYNCHRONOUS: it commits to memory and writes
+ * back in the background, coalescing bursts. Only commit() is synchronous.
+ * This shim used to flush on BOTH, and the flush rewrites the entire file --
+ * so a game storing its song database one key at a time cost O(N^2) SD writes.
+ * A real boot log shows it plainly:
+ *
+ *     423 full rewrites, entries growing 86 -> 419
+ *     8.7 MB written to SD to store a 42 KB file
+ *
+ * On a console reading from an SD card that is not a slow save, it is a boot
+ * that looks frozen. Deferring apply() to a debounce restores the documented
+ * behaviour and collapses those 423 rewrites into a handful. commit() still
+ * writes immediately, because callers are entitled to rely on that. */
+void unity_prefs_tick(void){
+  /* Counted in FRAMES rather than wall time: no timing API, no clock to get
+   * wrong, and the caller is the frame loop by construction. ~15 frames is a
+   * quarter-second at 60fps and comfortably longer than the bursts the game
+   * emits, so a run of applies collapses into one write. */
+  if(!g_kv_dirty || g_kv_flush_delay <= 0) return;
+  if(--g_kv_flush_delay > 0) return;
+  prefs_flush();
+}
+void unity_prefs_sync(void){ if(g_kv_dirty) prefs_flush(); }   /* shutdown/pause */
 
 /* ==========================================================================
  * getAll() boxed values: turn a stored KV into the Java object Unity expects.
@@ -444,6 +487,16 @@ void *unity_dispatch_object(void *recv, const void *id_, va_list va){ const stru
   /* The r127 shape exactly: an opaque handle where a File or String belonged.
    * It never returns NULL, so nothing downstream can tell this apart from a
    * real object -- which is why it has to be in the ledger. */
+  /* Round 158: an opaque object is never a valid stand-in for a Java ARRAY.
+   * Covers getDeviceIds()[I, getObbDirs()[Ljava/io/File; and
+   * getDevices(I)[Landroid/media/AudioDeviceInfo; -- all three reached this
+   * terminal and were answered with a handle the game then passed to
+   * GetArrayElements. */
+  { void *empty = jni_new_empty_array(id->sig);
+    if (empty) {
+      jni_note_approx("EMPTY-ARRAY", cls, m, id->sig);
+      return empty;
+    } }
   jni_note_approx("OPAQUE-OBJ", cls, m, id->sig);
   return jni_make_object(cls); /* default: opaque handle, never NULL */
 }
@@ -538,7 +591,11 @@ void unity_dispatch_void(void *recv, const void *id_, va_list va){ const struct 
     if(is_uh(h,UJ_INPUTSTREAM)&&h->fp){fclose(h->fp);h->fp=NULL;} return; }
   if (has(cls,"AssetFileDescriptor") && has(m,"close")){ UHandle*a=recv;
     if(is_uh(a,UJ_AFD)&&a->fd>=0){close(a->fd);a->fd=-1;} return; }
-  if (has(cls,"SharedPreferences$Editor") && has(m,"apply")){ debugPrintf("[prefs] apply\n"); prefs_flush(); return; }
+  if (has(cls,"SharedPreferences$Editor") && has(m,"apply")){
+    /* Defer, per Android's contract -- see unity_prefs_tick. Each apply pushes
+     * the deadline out, so a burst of N writes costs one flush, not N. */
+    g_kv_flush_delay = 15;          /* ~250 ms at 60fps; each apply re-arms it */
+    return; }
   if (has(cls,"SharedPreferences$Editor") && has(m,"putString")){ /* if routed here as void */
     const char*k=jni_string_utf(va_arg(va,void*)); const char*v=jni_string_utf(va_arg(va,void*));
     kv_set('S',k,v); return; }
@@ -552,7 +609,7 @@ void unity_dispatch_void(void *recv, const void *id_, va_list va){ const struct 
 /* ========================================================================== */
 void unity_jni_init(const char *data_root){
   /* data_root is nx_root() from main.c; the fallback only matters if that
-   * were ever NULL, and it should stay consistent with nx_root.c. */
+   * were ever NULL, and should stay consistent with nx_root.c. */
   snprintf(g_root,sizeof g_root,"%s",data_root && *data_root ? data_root : DATA_ROOT_DEFAULT);
   snprintf(g_assets,sizeof g_assets,"%s/assets",g_root);
   prefs_load();

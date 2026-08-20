@@ -132,7 +132,7 @@
 /* Bump when shipping. Printed at compile time (#pragma message in main.c)
  * and at boot, so a stale source tree is obvious from either the build
  * output or debug.log. */
-#define PHI_SRC_REV   "phigros-r1.0-release"
+#define PHI_SRC_REV   "phigros-r1.1-audiodiag"
 
 /* ---- Android package name -- VERIFY THIS AGAINST YOUR APK -----------------
  * Returned by our fake getPackageName(). Unity surfaces it as
@@ -305,6 +305,41 @@
 #error "PHI_FMOD_MIX_RATE must stay BELOW PHI_AUDIO_SAMPLE_RATE -- see the comment above it. Raising it to the device rate brings back stuttering audio."
 #endif
 #define PHI_AUDIO_CALLBACK_FRAMES 1024
+
+/* ---- output limiter ------------------------------------------------------
+ * This mixer sums FMOD's master output -- already mastered to within half a dB
+ * of full scale -- with NativeAudio's hitsounds at unity gain, and the total
+ * has to fit in 16 bits. A measured session sat at peak 31103-32767 for its
+ * whole length, so every hit landing during loud music was being hard-clipped.
+ * Android avoids this by giving each source its own AudioTrack and letting the
+ * OS mixer provide headroom; here they meet in one accumulator, so the headroom
+ * has to come from us.
+ *
+ * CEILING is where limiting starts, just under full scale. RELEASE is how much
+ * of the gap the gain closes per callback (~21 ms at 1024 frames / 48 kHz).
+ *
+ * 0.02 is deliberately SLOW, which is the opposite of the obvious choice.
+ * Modelling a rhythm-game load -- music pinned at 31103 with hits landing four
+ * times a second -- shows faster release makes things WORSE, because the gain
+ * re-rises between every hit and gets pulled down again by the next one:
+ *
+ *     release 0.02  ->  gain 0.759-0.799,  0.45 dB swing
+ *     release 0.05  ->  gain 0.759-0.848,  0.97 dB swing
+ *     release 0.10  ->  gain 0.759-0.906,  1.55 dB swing   (audible pumping)
+ *     release 0.25  ->  gain 0.759-0.982,  2.24 dB swing
+ *
+ * With hits this dense the right behaviour is near-static headroom, and 0.02
+ * settles to about -2.2 dB with almost no modulation. It only matters that the
+ * gain recovers at all so a quiet passage is not left ducked forever.
+ *
+ * The [audio] line reports "lim=<times engaged>/<current gain>". A gain sitting
+ * steady below 1.00 is the limiter doing its job; a gain visibly swinging is
+ * pumping, and the answer is a SMALLER release, not a larger one.
+ *
+ * Set PHI_AUDIO_LIMITER 0 to go back to hard clipping. */
+#define PHI_AUDIO_LIMITER         1
+#define PHI_AUDIO_LIMITER_CEILING 32700
+#define PHI_AUDIO_LIMITER_RELEASE 0.02f
 
 #include "nx_root.h"   /* nx_root(), nx_rp() -- DATA_ROOT/GAME_HOME are these */
 

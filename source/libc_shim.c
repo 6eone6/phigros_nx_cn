@@ -26,8 +26,12 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <malloc.h>
-#include "config.h"   /* GAME_HOME for the case-test scratch path */
-#include "nx_root.h"  /* runtime data root */
+#include "config.h"
+/* Both unconditional. asset_pack.c is always compiled and its query functions
+ * answer no-pack harmlessly when the feature is off, so the DECLARATIONS must
+ * always be visible -- several call sites below are not themselves gated. */
+#include "asset_pack.h"
+#include "nx_root.h"       /* runtime data root: works from any folder */
 #include "phigros_jni.h"
 #include <wchar.h>
 #include <wctype.h>
@@ -37,13 +41,9 @@
 #include <EGL/egl.h>     /* eglGetProcAddress: resolve the full GLES API for dlsym */
 
 #include "config.h"
-/* Unconditional. asset_pack.c is always compiled (the Makefile globs every .c
- * in source), and its query functions answer no-pack harmlessly when the
- * feature is off, so the DECLARATIONS must always be visible -- several call
- * sites below (opendir, closedir, readdir) are not themselves gated. The
- * upstream tree only ever built with PHI_ASSET_PACK=1, so this was latent
- * there; Phigros ships with it 0 for first boot, which exposes it. */
+#if PHI_ASSET_PACK
 #include "asset_pack.h"
+#endif
 #include "util.h"
 #include "error.h"
 #include "imports.h"   /* dynlib_find_export (dlsym shim lookup) */
@@ -678,11 +678,11 @@ static int path_is_gamedata(const char *p) {
 }
 /* Reduce any spelling of a game path to the pack key "assets/...".
  * Three forms reach us and they must all work:
- *   <root>/assets/...                 (nx_root(), whatever folder that is)
- *   /switch/phigros/assets/...        (no device prefix -- what Unity sends)
+ *   sdmc:/switch/fruitninja/assets/...   (DATA_ROOT, what the loader builds)
+ *   /switch/fruitninja/assets/...        (no device prefix -- what Unity sends)
  *   assets/...                           (relative to cwd)
  * Round 84 only handled the first, so il2cpp's open of
- * /switch/phigros/assets/bin/Data/Managed missed the pack and returned
+ * /switch/fruitninja/assets/bin/Data/Managed missed the pack and returned
  * -1, which is what triggered the fatal-error dialog. Returns NULL when the
  * path is not a packed game path. */
 const char *nx_pack_relpath(const char *path) {
@@ -1474,6 +1474,14 @@ static int oc_commit_locked(void *addr, size_t len) {
     }
     i += run;
   }
+  /* KEPT when the round-159 36-bit work was reverted (round 160), because this
+   * is not an address-space fix: the function is declared `int` and the success
+   * path had no `return` at all, so it handed back whatever happened to be in
+   * w0. That is undefined behaviour on any Switch. It is currently harmless
+   * only because both callers discard the result -- a landmine for whoever
+   * stops discarding it. `-Wall` reports `control reaches end of non-void
+   * function` as a warning, not an error, so it built for 150 rounds. */
+  return 1;
 }
 
 // munmap of an OC range: reclaim only UNCOMMITTED pages (the tail-overflow slack
@@ -2422,9 +2430,8 @@ void *getpwuid_fake(int uid) {
   (void)uid;
   static struct bionic_passwd pw;
   static char nm[] = "switch", sh[] = "/bin/sh", empty[] = "";
-  /* pw_dir is filled at CALL time, not statically: the data root is resolved at
-   * runtime now, so it is not a compile-time constant. Device prefix stripped,
-   * same as getenv("HOME") below -- the engine passes this straight to open(). */
+  /* pw_dir is filled at CALL time: the data root is resolved at runtime now, so
+   * it is not a compile-time constant. */
   static char dir[512];
   snprintf(dir, sizeof dir, "%s", nx_root_nodev());
   pw.pw_name = nm; pw.pw_passwd = empty; pw.pw_uid = 0; pw.pw_gid = 0;
@@ -2471,12 +2478,9 @@ void *dlsym_fake(void *handle, const char *symbol) {
   if (!symbol) return NULL;
   /* Firebase SWIG stub resolver (firebase_stub.c) -- see step 2b below. */
   extern void *firebase_stub_lookup(const char *symbol);
-  /* 0) NativeAudio playback entry points get a guarded wrapper. They index a
-   *    source table that is NULL until the engine initialises, and C# calls
-   *    them directly via DllImport, so an init failure otherwise becomes a null
-   *    dereference on the first note rather than silence. See phigros_jni.c. */
-  { void *g = phigros_audio_guard(symbol);
-    if (g) return g; }
+  /* NativeAudio playback exports are resolved STRAIGHT THROUGH. An earlier
+   * revision returned guarded wrappers here; they mangled arguments because
+   * their signatures were guessed. See phigros_jni.c. */
   /* 1) a real export from a loaded module (il2cpp/unity/main) */
   void *p = so_resolve_external(symbol);
   if (p) return p;
@@ -2520,20 +2524,154 @@ int pthread_rwlock_unlock_fake(void **rw) {
   return 0;
 }
 
-typedef struct { Semaphore sem; } FakeSem;
-int sem_init_fake(void **s, int pshared, unsigned int value) { (void)pshared; FakeSem *fs = calloc(1, sizeof(*fs)); semaphoreInit(&fs->sem, value); *s = fs; return 0; }
-int sem_destroy_fake(void **s) { if (s && *s) { free(*s); *s = NULL; } return 0; }
-int sem_post_fake(void **s) { if (s && *s) semaphoreSignal(&((FakeSem *)*s)->sem); return 0; }
-int sem_wait_fake(void **s) { if (s && *s) { Semaphore *sm=&((FakeSem *)*s)->sem; diag_wait_enter(DIAG_W_SEM,sm); semaphoreWait(sm); diag_wait_exit(); } return 0; }
-int sem_trywait_fake(void **s) { if (s && *s && semaphoreTryWait(&((FakeSem *)*s)->sem)) return 0; errno = EAGAIN; return -1; }
-int sem_getvalue_fake(void **s, int *val) { if (s && *s) *val = (int)((FakeSem *)*s)->sem.count; else *val = 0; return 0; }
+/* Round 160. `sem_t` here is just storage: sem_init allocates a FakeSem and
+ * writes the pointer into the caller's first 8 bytes, and every other sem_*
+ * dereferences that pointer. The only check was `*s != NULL`, which is not a
+ * check at all -- any non-zero garbage in those 8 bytes gets dereferenced.
+ *
+ * A 39-bit-mode log caught it: immediately after
+ *   "Cannot create FMOD::Sound instance for audio clip BladeCloudSwipe01"
+ * the crash was sem_post_fake -> semaphoreSignal -> mutexLock with
+ * far = 0x3465363564613065, which is the ASCII "e0ad5e64" -- a hex string where
+ * the FakeSem pointer belonged (the FMOD error text was still live in x13-x15).
+ * So FMOD called sem_post on memory that had never been sem_init'd by us, or
+ * had since been reused for text.
+ *
+ * The magic makes that detectable, and the alignment test rejects this exact
+ * value with no dereference at all: 0x...65 & 7 == 5. Same rule as the JNI
+ * pointer checks -- validate by VALUE first, only then read. */
+/* Defined further down with the GC bridge; the semaphore shim sits above it. */
+static int nx_addr_readable_shim(uintptr_t a, size_t n);
+
+#define FAKESEM_MAGIC 0x53454d31u   /* 'SEM1' */
+typedef struct { uint32_t magic; Semaphore sem; } FakeSem;
+
+/* Slots we have already proved readable. Round 162 audit: the first version of
+ * sem_resolve did TWO svcQueryMemory syscalls on EVERY sem_post/sem_wait/
+ * sem_trywait. Those are hot paths -- FMOD's mixer posts per audio buffer, and
+ * sem_timedwait polls every millisecond, so a 30 s wait would have burned
+ * ~60000 syscalls. That is a performance regression I introduced while fixing a
+ * crash, which is its own kind of bug.
+ *
+ * Caching is sound here because the danger is an address that was never ours,
+ * not one that stops being mapped: newlib keeps small allocations mapped after
+ * free (PHI_POISON_FREE overwrites them with 0xDE in place), so a slot proved
+ * readable once stays readable, and a freed FakeSem simply fails the magic test.
+ * Racy by design -- a torn read costs at most one redundant syscall. */
+#define SEMCACHE_N 16
+static void *volatile g_sem_seen[SEMCACHE_N];
+static volatile unsigned g_sem_seen_w;
+
+static int sem_slot_known(void **s) {
+  for (unsigned i = 0; i < SEMCACHE_N; i++)
+    if (g_sem_seen[i] == (void *)s) return 1;
+  return 0;
+}
+
+/* Resolve a caller's sem_t to one of OUR semaphores, or NULL. Never faults. */
+static FakeSem *sem_resolve(void **s) {
+  if (!s) return NULL;
+  const int known = sem_slot_known(s);
+  if (!known && !nx_addr_readable_shim((uintptr_t)s, sizeof(void *))) return NULL;
+  FakeSem *fs = (FakeSem *)*s;
+  const uintptr_t v = (uintptr_t)fs;
+  if (!v || (v & 7u) || v < 0x1000u) return NULL;      /* by value, no deref */
+  if (!known) {
+    if (!nx_addr_readable_shim(v, sizeof(FakeSem))) return NULL;
+    if (fs->magic != FAKESEM_MAGIC) return NULL;       /* don't cache strangers */
+    const unsigned w = g_sem_seen_w++;
+    g_sem_seen[w % SEMCACHE_N] = (void *)s;
+    return fs;
+  }
+  if (fs->magic != FAKESEM_MAGIC) return NULL;         /* destroyed or reused */
+  return fs;
+}
+
+/* A sem_t we do not recognise. Doing nothing can stall whoever waits on it;
+ * dereferencing it kills the console. Say so, rate-limited, and carry on. */
+static void sem_reject(const char *who, void **s) {
+  static int n = 0;
+  if (n < 8) { n++;
+    debugPrintf("[sem] %s on a sem_t we never initialised: slot=%p holds %p "
+                "-- ignored (dereferencing it would fault)\n",
+                who, (void *)s, (s && nx_addr_readable_shim((uintptr_t)s, 8)) ? *s : NULL); }
+}
+int sem_init_fake(void **s, int pshared, unsigned int value) {
+  (void)pshared;
+  if (!s) return -1;
+  FakeSem *fs = calloc(1, sizeof(*fs));
+  if (!fs) { *s = NULL; errno = ENOMEM; return -1; }   /* was an unchecked deref */
+  semaphoreInit(&fs->sem, value);
+  fs->magic = FAKESEM_MAGIC;      /* last: a racing reader sees it fully built */
+  *s = fs;
+  return 0;
+}
+int sem_destroy_fake(void **s) {
+  FakeSem *fs = sem_resolve(s);
+  if (fs) { fs->magic = 0; *s = NULL; free(fs); }   /* clear first: see free_ref */
+  else if (s && *s) { *s = NULL; }                  /* not ours -- drop, never free */
+  return 0;
+}
+int sem_post_fake(void **s) {
+  FakeSem *fs = sem_resolve(s);
+  if (fs) semaphoreSignal(&fs->sem);
+  else if (s && *s) sem_reject("sem_post", s);
+  return 0;
+}
+int sem_wait_fake(void **s) {
+  FakeSem *fs = sem_resolve(s);
+  if (!fs) { if (s && *s) sem_reject("sem_wait", s); return 0; }
+  Semaphore *sm = &fs->sem;
+  diag_wait_enter(DIAG_W_SEM, sm); semaphoreWait(sm); diag_wait_exit();
+  return 0;
+}
+int sem_trywait_fake(void **s) {
+  FakeSem *fs = sem_resolve(s);
+  if (fs && semaphoreTryWait(&fs->sem)) return 0;
+  if (!fs && s && *s) sem_reject("sem_trywait", s);
+  errno = EAGAIN; return -1;
+}
+int sem_getvalue_fake(void **s, int *val) {
+  FakeSem *fs = sem_resolve(s);
+  if (val) *val = fs ? (int)fs->sem.count : 0;
+  return 0;
+}
 // no native timed wait on libnx Semaphore; poll with a short backoff to the
 // deadline. The engine uses it as a yield-with-timeout in its task scheduler.
+/* Milliseconds from now until an absolute CLOCK_REALTIME deadline, clamped.
+ * Round 161: both timed-wait shims used to ignore `abs` entirely and give up
+ * after a hard-coded 1000 ms. A caller asking for five seconds got a spurious
+ * ETIMEDOUT at one -- and a spurious timeout is not a harmless approximation
+ * here: it tells the caller an operation failed that did not. FMOD's
+ * "An error occured that wasn't supposed to" (FMOD_ERR_INTERNAL) in the r160
+ * log is exactly what a component does when a wait it expected to succeed
+ * reports a timeout.
+ *
+ * A NULL deadline means "wait forever" in POSIX; we cap it rather than hang,
+ * because a stuck console is worse than a late timeout. */
+static unsigned nx_abs_to_ms(const struct timespec *abs, unsigned cap_ms) {
+  if (!abs) return cap_ms;
+  struct timespec now;
+  if (clock_gettime(CLOCK_REALTIME, &now) != 0) return cap_ms;
+  long long ms = (long long)(abs->tv_sec - now.tv_sec) * 1000LL
+               + (long long)(abs->tv_nsec - now.tv_nsec) / 1000000LL;
+  if (ms <= 0) return 0;
+  return (ms > (long long)cap_ms) ? cap_ms : (unsigned)ms;
+}
+
+/* Public wrapper so imports.c's pthread_mutex_timedlock can share the logic. */
+unsigned nx_abs_to_ms_pub(const struct timespec *abs, unsigned cap_ms) {
+  return nx_abs_to_ms(abs, cap_ms);
+}
+
 int sem_timedwait_fake(void **s, const struct timespec *abs) {
-  (void)abs;
-  for (int i = 0; i < 1000; i++) {
+  /* 30 s cap: long enough that no legitimate wait is cut short, short enough
+   * that a lost post cannot wedge the console forever. */
+  unsigned ms = nx_abs_to_ms(abs, 30000u);
+  if (sem_trywait_fake(s) == 0) return 0;
+  while (ms--) {
+    svcSleepThread(1000000ull);            // 1 ms
     if (sem_trywait_fake(s) == 0) return 0;
-    svcSleepThread(1000000ull); // 1 ms
   }
   errno = ETIMEDOUT;
   return -1;

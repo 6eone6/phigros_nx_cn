@@ -73,4 +73,9 @@ extern void       *jni_make_object(const char *label);
 extern void       *jni_bytearray_data(void *arr, int *len_out);
 extern const char *jni_string_utf(void *jstr);
 
+/* PlayerPrefs write-back. apply() is deferred (Android semantics); call tick()
+ * from the frame loop and sync() before shutdown. */
+void unity_prefs_tick(void);
+void unity_prefs_sync(void);
+
 #endif /* UNITY_JNI_H */

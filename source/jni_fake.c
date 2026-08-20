@@ -165,29 +165,27 @@ static void *reg_local(void *ref) {
  * pool did not: it aliased every further label to iobj_pool[0], so past 128
  * distinct classes every opaque object became the same object -- IsSameObject,
  * identity comparisons and per-object state all collapse, silently. */
-/* GROWABLE, and therefore never overflows into the fragile path.
+/* GROWABLE. Phigros change, kept on top of the r155 hardening below.
  *
- * This used to be a fixed array of 2048 FakeString STRUCTS. Past 2048 distinct
- * strings, jni_make_string fell back to a one-off reg_local() string, and the
+ * This was a fixed array of 2048 FakeString STRUCTS, and past 2048 distinct
+ * strings jni_make_string fell back to a one-off reg_local() string -- the
  * comment called that "correct, just more churn". It is not correct: a local
- * reference dies when its frame is popped, and a pooled string never does. The
- * boot log shows the consequence exactly one screen apart --
- *     [jni] intern-string pool full (2048) ...        (line 1089)
- *     [prefs] putString SKIP empty key                (line 1198)
+ * reference dies when its frame pops, a pooled string never does. On Phigros
+ * the boot log showed the consequence one screen apart --
+ *     [jni] intern-string pool full (2048)
+ *     [prefs] putString SKIP empty key
  * -- and from then on EVERY PlayerPrefs write was dropped, because the key
- * jstring had been reclaimed before we read it. The game could not save at all.
- * (The same lost-argument shape is described in the getProperty comment further
- * down, which worked around it rather than fixing it.)
+ * jstring had been reclaimed before it was read. The game could not save.
  *
- * The array could not simply be made bigger by realloc, because callers hold
- * pointers INTO it. So it is now an array of POINTERS to individually
- * allocated strings: growing the index never moves a string. Pooled strings
- * are immortal, which is what makes them safe to hand out.
+ * It could not simply be made bigger with realloc, because callers hold
+ * pointers INTO it. It is now an array of POINTERS to individually allocated
+ * strings, so growing the index never moves a string. That is also why pooled
+ * strings carry a `pooled` FLAG instead of living in an address range -- see
+ * ref_is_pooled, which keeps range tests for the pools that are still arrays.
  *
- * Storage is bounded in practice by the number of DISTINCT strings the game
- * uses -- they are deduplicated on insert -- so this is not an unbounded leak.
- * The lookup is a hash bucket rather than the old linear strcmp scan, which at
- * 2048 entries was already O(n) on every single string the engine created. */
+ * Bounded in practice by the number of DISTINCT strings (they are deduplicated),
+ * and the lookup is hashed rather than the old linear strcmp scan, which at
+ * 2048 entries ran on every string the engine created. */
 #define ISTR_BUCKETS 4096
 typedef struct IStrNode { struct IStrNode *next; FakeString *s; uint32_t h; } IStrNode;
 static IStrNode *istr_buckets[ISTR_BUCKETS];
@@ -199,18 +197,37 @@ static uint32_t istr_hash(const char *u) {
   return h;
 }
 
+/* Defined after the pools, which are declared below this point -- that file
+ * ordering is exactly why the old range test could only cover istr_pool. */
+static int ref_is_pooled(const void *r);
+
 static void free_ref(void *ref) {
   if (!ref)
     return;
-  /* Pooled strings are marked, not address-ranged: they are individually
-   * allocated now, so there is no contiguous range to test. */
-  if (nx_tag_of(ref) == TAG_STRING && ((const FakeString *)ref)->pooled)
-    return;  // interned string -- pooled, never freed
+  /* Round 155 (A5 in the shim-fixes note). Pooled references are SHARED: one
+   * object per class label, one string per contents, handed to every caller
+   * that asks. Freeing or tag-clearing one kills it for every other holder --
+   * from then on nx_tag_of() reports "not ours" for that label for the rest of
+   * the session, and every guard downstream silently takes its wrong branch.
+   *
+   * This test must come FIRST and cover EVERY pool. Previously only istr_pool
+   * was checked; iobj_pool, class_pool and id_pool survived only because their
+   * tags happen to fall through the switch below. That is luck, not design, and
+   * it stops being true the moment anything clears a tag before freeing --
+   * which is precisely what this round adds. */
+  if (ref_is_pooled(ref)) return;
   switch (nx_tag_of(ref)) {
-    case TAG_STRING: { FakeString *s = ref; free(s->utf); free(s); break; }
-    case TAG_PRIARR: { FakePriArray *a = ref; free(a->data); free(a); break; }
-    case TAG_OBJARR: { FakeObjArray *a = ref; free(a->items); free(a); break; }
-    case TAG_OBJECT: free(ref); break;
+    /* Clear the tag and the inner pointer BEFORE releasing anything (A4). It
+     * closes the window where the struct still reads a valid tag while its
+     * payload is already gone, and it makes a double delete harmless: the
+     * second call sees tag 0 and takes the default branch. */
+    case TAG_STRING: { FakeString *s = ref; char *u = s->utf;
+                       s->tag = 0; s->utf = NULL; free(u); free(s); break; }
+    case TAG_PRIARR: { FakePriArray *a = ref; void *d = a->data;
+                       a->tag = 0; a->data = NULL; a->len = 0; free(d); free(a); break; }
+    case TAG_OBJARR: { FakeObjArray *a = ref; void **it = a->items;
+                       a->tag = 0; a->items = NULL; a->len = 0; free(it); free(a); break; }
+    case TAG_OBJECT: *(volatile uint32_t *)ref = 0; free(ref); break;
     case BITMAP_TAG: text2bitmap_free((FakeBitmap *)ref); break;
     default: break; // TAG_ID / TAG_CLASS are pooled
   }
@@ -289,19 +306,19 @@ void *jni_make_string(const char *utf) {
     mutexUnlock(&locals_lock);
     return NULL;
   }
-  s->tag = TAG_STRING;
   s->utf = dup;
-  s->pooled = 1;                                   /* immortal; free_ref skips it */
+  s->pooled = 1;                                   /* ref_is_pooled skips it */
+  s->tag = TAG_STRING;                             /* last: never publish half-built */
   n->s = s; n->h = h; n->next = *head; *head = n;
   istr_count++;
-  { static int next_report = 4096;                 /* growth is worth noticing */
+  { static int next_report = 4096;
     if (istr_count >= next_report) {
       next_report *= 2;
       debugPrintf("[jni] interned strings: %d distinct (pool grows; no string is "
                   "ever a fragile local)\n", istr_count);
     } }
   mutexUnlock(&locals_lock);
-  return s;                                        // pooled, not reg_local'd
+  return s;
 }
 
 static void *make_pri_array_adopt(void *data, int len, int elem_size) {
@@ -315,8 +332,15 @@ static void *make_pri_array_adopt(void *data, int len, int elem_size) {
 
 static const char *obj_str(void *jstr) {
   FakeString *s = jstr;
-  if (s && nx_tag_of(s) == TAG_STRING)
-    return s->utf;
+  if (s && nx_tag_of(s) == TAG_STRING) {
+    /* Round 156. utf CAN be NULL now: free_ref clears it before releasing the
+     * buffer (r155/A4), so a concurrent reader that already passed the tag
+     * check above can land in that window. Callers do strlen()/utf16_len()/
+     * utf[0] on this, so returning NULL is a crash where "" is a wrong answer.
+     * One load, then work off the copy. */
+    const char *u = *(const char * volatile const *)&s->utf;
+    return u ? u : "";
+  }
   return "";
 }
 
@@ -439,6 +463,7 @@ static void *get_classloader_obj(void) {
 
 #define MAX_IDS 512
 static FakeID id_pool[MAX_IDS];
+
 static int id_count = 0;
 
 /* ---- field writes (round 132) --------------------------------------------
@@ -752,6 +777,35 @@ typedef struct { uint32_t tag; uint32_t pad; long long ptr; } FakeProxy;
 static FakeProxy g_proxy_pool[MAX_PROXY_OBJ];
 static int g_proxy_pool_n = 0;
 static FakeProxy *g_last_proxy = 0;
+
+/* Every SHARED reference in this file -- five static pools and three calloc'd
+ * singletons. Defined here, below the last of them, so the list cannot be
+ * written before the things it has to cover exist; free_ref forward-declares it.
+ *
+ * The first version of this (round 155) listed only four pools and claimed to
+ * cover them all. It missed g_proxy_pool and the three singletons, which are
+ * shared exactly the same way. They stayed safe only because TAG_CLASS has no
+ * case in free_ref's switch and falls through `default:` -- the same luck this
+ * predicate exists to stop relying on. An audit caught it before it shipped.
+ *
+ * Adding a `case TAG_CLASS:` to that switch without adding the object here
+ * would kill a shared reference for every holder. If you add a pool or a
+ * singleton, add it here. */
+static int ref_is_pooled(const void *r) {
+  const char *p = (const char *)r;
+  if (!p) return 0;
+  if (r == (const void *)g_activity_obj ||
+      r == (const void *)g_asset_mgr    ||
+      r == (const void *)g_classloader) return 1;
+  /* Interned strings are individually allocated now (see the pool above), so
+   * there is no range to test -- they are marked instead. Checked before the
+   * range tests because it is the common case. */
+  if (nx_tag_of(r) == TAG_STRING && ((const FakeString *)r)->pooled) return 1;
+  return (p >= (const char *)iobj_pool    && p < (const char *)&iobj_pool[MAX_IOBJ])    ||
+         (p >= (const char *)class_pool   && p < (const char *)&class_pool[MAX_CLASSES])||
+         (p >= (const char *)id_pool      && p < (const char *)&id_pool[MAX_IDS])       ||
+         (p >= (const char *)g_proxy_pool && p < (const char *)&g_proxy_pool[MAX_PROXY_OBJ]);
+}
 static void *proxy_make(long long ptr) {
   if (g_proxy_pool_n >= MAX_PROXY_OBJ) return jni_make_object("jniproxy");
   FakeProxy *p = &g_proxy_pool[g_proxy_pool_n++];
@@ -799,13 +853,32 @@ static void deliver_doframe(void *cb) {
                get_id("android/view/Choreographer$FrameCallback", "doFrame", "(J)V"), args);
 }
 /* drain thread: runs posted work off the main thread (no self-deadlock / re-entrancy) */
-#define RUNQ_N 128
+/* Round 166. Was 128, and a full ring DROPPED the Runnable silently -- no log,
+ * no counter. Handler.post and runOnUiThread are how a Unity Android game
+ * defers UI setup, so a dropped post is a screen step that never happens: the
+ * screen object exists, its contents were never built, and the engine keeps
+ * rendering an empty scene. That is the softlock, and it explains the timing
+ * signature exactly -- it goes away with a CPU overclock, gets worse with debug
+ * logging (which slows every drained Runnable), and gets worse at lower clocks.
+ * A single drain thread executing managed code per item cannot keep up, the
+ * ring fills, and the losses were invisible. */
+#define RUNQ_N 1024
 static void *g_runq[RUNQ_N]; static int g_runq_kind[RUNQ_N]; static int g_runq_head = 0, g_runq_tail = 0;
 static Mutex g_runq_lk; static CondVar g_runq_cv; static int g_runq_started = 0;
+static CondVar g_runq_space;              /* signalled when a slot frees */
+static __thread int g_in_drain;           /* set on the drain thread only */
+static unsigned g_runq_dropped, g_runq_waited, g_runq_hiwater;
+
+void nx_runq_stats(unsigned *dropped, unsigned *waited, unsigned *hiwater) {
+  if (dropped) *dropped = g_runq_dropped;
+  if (waited)  *waited  = g_runq_waited;
+  if (hiwater) *hiwater = g_runq_hiwater;
+}
 static void run_drain_thread(void *arg) {
   (void)arg;
   static uint8_t drain_tls[BIONIC_TLS_SIZE] __attribute__((aligned(16)));
   install_bionic_tls(drain_tls);
+  g_in_drain = 1;                          /* never block this thread on post */
   for (;;) {
     mutexLock(&g_runq_lk);
     if (g_runq_head == g_runq_tail) {
@@ -816,6 +889,7 @@ static void run_drain_thread(void *arg) {
     if (g_runq_head != g_runq_tail) {
       o = g_runq[g_runq_head]; k = g_runq_kind[g_runq_head];
       g_runq_head = (g_runq_head + 1) % RUNQ_N; have = 1;
+      condvarWakeOne(&g_runq_space);      /* a slot just freed */
     }
     void *fcb = g_frame_cb; g_frame_cb = 0;   /* one-shot: doFrame re-registers */
     mutexUnlock(&g_runq_lk);
@@ -833,7 +907,32 @@ static void runq_post(void *obj, int kind) {
       threadStart(&g_runq_thr);
   }
   int nt = (g_runq_tail + 1) % RUNQ_N;
-  if (nt != g_runq_head) { g_runq[g_runq_tail] = obj; g_runq_kind[g_runq_tail] = kind; g_runq_tail = nt; }
+  /* Full: wait for the drain thread to free a slot rather than discard the
+   * work. Bounded so a wedged drainer cannot wedge the game too, and NEVER
+   * entered from the drain thread itself -- a Runnable that posts another
+   * Runnable would otherwise wait on itself. */
+  if (nt == g_runq_head && !g_in_drain) {
+    for (int i = 0; i < 64 && nt == g_runq_head; i++) {    /* <= ~64 ms */
+      g_runq_waited++;
+      condvarWaitTimeout(&g_runq_space, &g_runq_lk, 1000000ull);   /* 1 ms */
+      nt = (g_runq_tail + 1) % RUNQ_N;
+    }
+  }
+  if (nt != g_runq_head) {
+    g_runq[g_runq_tail] = obj; g_runq_kind[g_runq_tail] = kind; g_runq_tail = nt;
+    unsigned depth = (unsigned)((g_runq_tail - g_runq_head + RUNQ_N) % RUNQ_N);
+    if (depth > g_runq_hiwater) g_runq_hiwater = depth;
+  } else {
+    /* Last resort. Loud, because this is a UI callback the game will never see
+     * and every previous one of these was invisible. */
+    g_runq_dropped++;
+    static int nlog = 0;
+    if (nlog < 8) { nlog++;
+      debugPrintf("[runq] *** DROPPED a %s after waiting -- queue full (%d). "
+                  "The game posted work that will NEVER run; expect a screen "
+                  "that displays but is empty. ***\n",
+                  kind == 0 ? "Runnable" : "Message", RUNQ_N); }
+  }
   condvarWakeOne(&g_runq_cv);
   mutexUnlock(&g_runq_lk);
 }
@@ -1162,6 +1261,21 @@ static void *act_object(const FakeID *id, va_list va) {
   // here is why the version stayed blank even with field access fixed -- Unity
   // got a null PackageInfo and never read the field. Hand back live (opaque)
   // objects; the subsequent field reads then resolve via field_object/field_int.
+  /* MediaRouter.getSelectedRoute -- round 165. The ledger had this as NULL-OBJ
+   * and INSPECTED, i.e. Unity reads the result back. It is the audio-routing
+   * query: Unity asks which route is selected and then reads properties off it.
+   * A null route is how Android says "no audio device", and an engine that
+   * believes that has no reason to keep an output alive -- which is the shape
+   * of "sound died after backing out of a game", reported twice.
+   *
+   * Same rule as the getPackageInfo family right below: hand back a live opaque
+   * object so the chain continues and the follow-up getters resolve through
+   * field_object/field_int, rather than a null that ends it. */
+  if (name_has(id->name, "getSelectedRoute") || name_has(id->name, "getRouteAt"))
+    return jni_make_object("android/media/MediaRouter$RouteInfo");
+  if (name_has(id->name, "getDefaultRoute"))
+    return jni_make_object("android/media/MediaRouter$RouteInfo");
+
   if (name_has(id->name, "getPackageInfo"))     return jni_make_object("android/content/pm/PackageInfo");
   if (name_has(id->name, "getApplicationInfo")) return jni_make_object("android/content/pm/ApplicationInfo");
   if (name_has(id->name, "getPackageManager"))  return jni_make_object("android/content/pm/PackageManager");
@@ -1400,6 +1514,24 @@ static float act_float(const FakeID *id, va_list va) {
 
 static void act_void(const FakeID *id, va_list va) {
   if (name_has(id->name, "runOnUiThread")) { post_runnable(va_arg(va, void *)); return; }
+  /* Thread.start() is a VOID-NOP here, and the ledger marks it INSPECTED. That
+   * means the game starts a Java thread whose body NEVER RUNS -- anything it
+   * was going to do simply does not happen, silently.
+   *
+   * Not implemented rather than faked: a java.lang.Thread's run() lives in Java
+   * we do not have, and invoking a plugin's thread body synchronously on the
+   * caller could block the very thread that asked. The engine keeps rendering
+   * through the softlocks, so nothing is waiting on these -- but we cannot tell
+   * a harmless Helpshift/Backtrace worker from something the game needs without
+   * knowing WHICH. Name it, capped, so the next log answers that. */
+  if (!strcmp(id->name, "start") && name_has(id->cls, "Thread")) {
+    static int n = 0;
+    if (n < 12) { n++;
+      debugPrintf("[jni] Thread.start() on %s -- its run() will NEVER execute "
+                  "(no Java runtime); anything it was to do is silently skipped\n",
+                  id->cls); }
+    return;
+  }
   if (name_has(id->name, "sendToTarget")) { post_message(); return; }
   if (name_has(id->name, "postFrameCallback")) {
     void *cb = va_arg(va, void *);
@@ -1442,16 +1574,16 @@ static void act_void(const FakeID *id, va_list va) {
 static int is_t2b(const char *cls)  { return name_has(cls, "Text2Bitmap"); }
 static int is_mov(const char *cls)  { return name_has(cls, "MoviePlayer"); }
 
-// Breadcrumb: the game's own Java side is reached only through JNI upcalls.
-// For Phigros the dex shows com/PigeonGames/Phigros/*, com/Exceed7/NativeAudio/*
-// (handled in phigros_jni.c), com/taptap/sdk/* and com/tapsdk/antiaddiction/*
-// -- but not which the C# actually invokes or in what order. Log each unique
-// app-class upcall once so the first run that reaches the login/save stage
+// Breadcrumb: the game's own Java side (jp.kiteretsu.* save/load + license
+// plugin) is reached only through JNI upcalls. The DEX shows the exact classes
+// (loadsavedata.{SRecord,SCryption,SUtility,NativeLoad}, LicenseVerification),
+// but not which the C# actually invokes or in what order. Log each unique
+// app-class upcall once so the first run that reaches the save/license stage
 // tells us precisely what to implement, instead of guessing. Behaviour is
 // unchanged: after logging, the call still falls through to the act_* handlers.
 static void log_app_upcall(const FakeID *id) {
   /* Phigros app-owned Java namespaces. "kiteretsu" was Zookeeper's and matched
-   * nothing here, which would have made this diagnostic silently useless. */
+   * nothing here, which made this diagnostic silently useless. */
   if (!name_has(id->cls, "PigeonGames") &&
       !name_has(id->cls, "Exceed7")     &&
       !name_has(id->cls, "taptap")      &&
@@ -1481,7 +1613,7 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
    * Uri.encode(...); without real bytes the whole chain collapsed to "" and
    * every encoded-key pref collided. Route by the FakeString receiver. */
   if (recv && nx_tag_of(recv) == TAG_STRING && name_has(id->name, "getBytes")) {
-    const char *u = ((FakeString *)recv)->utf; int n = (int)strlen(u);
+    const char *u = safe_utf(recv); int n = (int)strlen(u);
     char *d = malloc(n > 0 ? n : 1); if (n) memcpy(d, u, n);
     return make_pri_array_adopt(d, n, 1);
   }
@@ -1542,6 +1674,29 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
       return jni_make_string(nx_managed_root());
     }
   }
+  /* File.getParent on one of OUR Files. Round 165: this fell through to the
+   * String catch-all and answered "", which the ledger showed as EMPTY-STRING
+   * and INSPECTED -- Unity reads it back. Java returns null for a root and the
+   * containing directory otherwise; "" is neither, and code that joins it to a
+   * child name builds a RELATIVE path that then resolves against the cwd.
+   * Same receiver routing as getAbsolutePath above, for the same reason: Unity
+   * calls getParent on its own Files too and must keep getting its own answer. */
+  if (recv && nx_tag_of(recv) == TAG_OBJECT &&
+      (!strcmp(id->name, "getParent") || !strcmp(id->name, "getParentFile"))) {
+    const FakeObject *fo = (const FakeObject *)recv;
+    if (!strcmp(fo->label, "java/io/File") || !strcmp(fo->label, "File")) {
+      if (!strcmp(id->name, "getParentFile")) return jni_make_object("java/io/File");
+      extern const char *nx_managed_root(void);
+      const char *root = nx_managed_root();
+      const char *slash = root ? strrchr(root, '/') : NULL;
+      if (!slash || slash == root) return jni_make_string("/");
+      { char buf[512];
+        size_t n2 = (size_t)(slash - root);
+        if (n2 >= sizeof buf) n2 = sizeof buf - 1;
+        memcpy(buf, root, n2); buf[n2] = 0;
+        return jni_make_string(buf); }
+    }
+  }
   if (phigros_owns_class(id->cls)) return phigros_dispatch_object(recv, id, va);
   if (unity_owns_class(id->cls)) return unity_dispatch_object(recv, id, va);
   // any method returning a Bitmap is text rendering (Char2Bitmap / getShadowBitmap
@@ -1559,9 +1714,10 @@ static juint dispatch_int(void *recv, const FakeID *id, va_list va) {
   // on the receiver tag + method name, NOT id->cls. Returning 0 here (the old
   // act_int fall-through) undersizes the OBB-path sprintf buffer and overflows.
   if (recv && nx_tag_of(recv) == TAG_STRING) {
-    if (!strcmp(id->name, "length"))   return utf16_len(((FakeString *)recv)->utf);
+    /* safe_utf, not ->utf: the field can be NULL mid-free (see obj_str). */
+    if (!strcmp(id->name, "length"))   return utf16_len(safe_utf(recv));
     if (!strcmp(id->name, "hashCode")) return 0;
-    if (!strcmp(id->name, "isEmpty"))  return ((FakeString *)recv)->utf[0] == '\0';
+    if (!strcmp(id->name, "isEmpty"))  return safe_utf(recv)[0] == '\0';
     /* String.equals(Object) -- round 131. The ledger caught this falling to
      * act_int, i.e. we answered "not equal" for EVERY string comparison, and
      * marked it INSPECTED (Unity read the result back). Compare the UTF-8 the
@@ -1571,7 +1727,7 @@ static juint dispatch_int(void *recv, const FakeID *id, va_list va) {
       const void *o = va_arg(va, void *);
       if (o == recv) return 1;
       if (!o || nx_tag_of(o) != TAG_STRING) return 0;
-      return !strcmp(((FakeString *)recv)->utf, ((FakeString *)o)->utf);
+      return !strcmp(safe_utf(recv), safe_utf((void *)o));
     }
   }
   /* Boxed PlayerPrefs value (Integer/Long/Boolean) from getAll(): unbox by the
@@ -1989,6 +2145,40 @@ static void j_GetStringRegion(void *env, void *jstr, int start, int len, uint16_
 }
 // GetStringLength must return the UTF-16 code-unit count, not the byte count
 // (CJK text is multi-byte in UTF-8); engine code sizes UTF-16 buffers with it.
+/* Buffers handed out by GetStringChars, so Release only frees what we issued.
+ * Round 162 audit: this used to `free()` whatever pointer arrived. That is
+ * unconditional heap corruption if the engine ever passes something else -- and
+ * there is a specific, plausible mix-up available, because GetStringUTFChars
+ * returns `s->utf` DIRECTLY (is_copy = 0, see its no-op Release). Freeing that
+ * would destroy a pooled interned string's buffer for every other holder, which
+ * is the r155/A5 failure mode reached through a different door.
+ *
+ * Same rule as ref_is_pooled: never release a pointer we cannot prove we
+ * allocated. Small and racy-tolerant -- a miss leaks 2 bytes per char, a false
+ * free corrupts the heap, so the asymmetry is the whole point. */
+#define STRCHARS_N 32
+static void *g_strchars[STRCHARS_N];
+static int   g_strchars_w;
+
+static void strchars_remember(void *p) {
+  if (!p) return;
+  mutexLock(&locals_lock);
+  void *evict = g_strchars[g_strchars_w];
+  g_strchars[g_strchars_w] = p;
+  g_strchars_w = (g_strchars_w + 1) % STRCHARS_N;
+  mutexUnlock(&locals_lock);
+  if (evict) free(evict);      /* outside the lock; oldest wins, bounded */
+}
+
+static int strchars_take(void *p) {
+  int found = 0;
+  mutexLock(&locals_lock);
+  for (int i = 0; i < STRCHARS_N; i++)
+    if (g_strchars[i] == p) { g_strchars[i] = NULL; found = 1; break; }
+  mutexUnlock(&locals_lock);
+  return found;
+}
+
 /* GetStringChars (slot 165): return a NUL-terminated UTF-16 (jchar) buffer.
  * JNI lets us always report "is a copy"; the matching ReleaseStringChars
  * frees it. BMP + surrogate pairs, matching NewString's coverage. */
@@ -2018,13 +2208,20 @@ static const uint16_t *j_GetStringChars(void *env, void *jstr, uint8_t *is_copy)
   }
   out[o] = 0;
   if (is_copy) *is_copy = 1;
+  strchars_remember(out);        /* only these may ever be freed by Release */
   return out;
 }
 
 /* ReleaseStringChars (slot 166): free what GetStringChars returned. */
 static void j_ReleaseStringChars(void *env, void *jstr, const uint16_t *chars) {
   (void)env; (void)jstr;
-  free((void *)chars);
+  if (!chars) return;
+  if (strchars_take((void *)chars)) { free((void *)chars); return; }
+  static int n = 0;
+  if (n < 8) { n++;
+    debugPrintf("[jni] ReleaseStringChars on %p which we did not allocate "
+                "-- NOT freeing (it may be an interned string's buffer)\n",
+                (const void *)chars); }
 }
 
 static juint j_GetStringLength(void *env, void *jstr) {
@@ -2037,8 +2234,10 @@ static juint j_GetStringLength(void *env, void *jstr) {
 static juint j_GetArrayLength(void *env, void *arr) {
   (void)env;
   FakeObjArray *a = arr;
-  if (a && (nx_tag_of(a) == TAG_PRIARR || nx_tag_of(a) == TAG_OBJARR))
-    return a->len;
+  if (!a) return 0;
+  const uint32_t t = nx_tag_of(a);            /* one read, one possible warn */
+  if (t == TAG_PRIARR || t == TAG_OBJARR)
+    return *(int volatile const *)&a->len;
   return 0;
 }
 
@@ -2052,11 +2251,18 @@ static void *j_NewFloatArray(void *env, int len) { (void)env; return new_pri_arr
 
 static void *j_NewObjectArray(void *env, int len, void *cls, void *init) {
   (void)env; (void)cls;
+  /* Round 162 audit: both callocs were unchecked and `len` unvalidated, so a
+   * negative or absurd length from the engine became `calloc(len, 8)` and then
+   * an unconditional write through the result. NULL is a legal JNI answer for
+   * a failed array allocation; a NULL deref is not. */
+  if (len < 0 || (size_t)len > (SIZE_MAX / sizeof(void *)) / 2) return NULL;
   FakeObjArray *a = calloc(1, sizeof(*a));
-  a->tag = TAG_OBJARR;
+  if (!a) return NULL;
+  a->items = calloc((size_t)(len ? len : 1), sizeof(void *));
+  if (!a->items) { free(a); return NULL; }
   a->len = len;
-  a->items = calloc(len ? len : 1, sizeof(void *));
   for (int i = 0; i < len; i++) a->items[i] = init;
+  a->tag = TAG_OBJARR;           /* last: never publish a half-built array */
   return reg_local(a);
 }
 /* Public one-liner so other TUs can hand back a real array instead of an opaque
@@ -2065,15 +2271,68 @@ void *jni_new_object_array(int len, void *fill) {
   return j_NewObjectArray(NULL, len, NULL, fill);
 }
 
+/* Empty array matching a method signature's return type, or NULL if the
+ * signature does not return an array. Round 158.
+ *
+ * act_object has had this rule since the r-old array work, but
+ * unity_dispatch_object answers first and its terminal hands back an OPAQUE
+ * OBJECT for anything unmatched -- so array-returning calls routed there never
+ * reached it. The r147 log shows InputDevice.getDeviceIds()[I taking that path
+ * twice per boot and landing in the r145 scratch buffer.
+ *
+ * Java semantics are the point: `null.length` throws, `new T[0].length` is 0,
+ * and every for-each over an empty array is skipped. An empty array is the
+ * correct way to say "none available"; an opaque object is silently mistaken
+ * for a real one, and GetArrayLength tag-checks it and answers 0 by accident
+ * rather than by design. */
+void *jni_new_empty_array(const char *sig) {
+  const char *r = sig ? strchr(sig, ')') : NULL;
+  if (!r || r[1] != '[') return NULL;
+  if (r[2] == 'L' || r[2] == '[') return jni_new_object_array(0, NULL);
+  int esz;
+  switch (r[2]) {
+    case 'J': case 'D': esz = 8; break;
+    case 'I': case 'F': esz = 4; break;
+    case 'S': case 'C': esz = 2; break;
+    default:            esz = 1; break;   /* Z, B */
+  }
+  return new_pri_array(0, esz);
+}
+
+/* Validate the value we are ABOUT to use, not the field it lives in (A2 in the
+ * shim-fixes note). The old form read a->items twice -- the compiler cannot
+ * cache it across the nx_tag_of() call -- so a concurrent free in that window
+ * could hand back a pointer that was never validated. Take exactly one load of
+ * each field and work off the local copies. */
+static void **objarr_items(const void *arr, int i) {
+  const FakeObjArray *a = arr;
+  if (!a || nx_tag_of(a) != TAG_OBJARR) return NULL;
+  void **it   = *(void ** volatile const *)&a->items;
+  const int n = *(int volatile const *)&a->len;
+  if (i < 0 || i >= n) return NULL;
+  /* 4, not 8 -- matches nx_tag_of's alignment contract (FakeID is 324 bytes,
+   * FakeClass 100, so pooled entries are only 4-aligned). 0xDE & 3 == 2, so
+   * this rejects a poisoned pointer without ever dereferencing it. */
+  if (!it || ((uintptr_t)it & 3u) || (uintptr_t)it < 0x1000u) return NULL;
+  return it;
+}
+
 static void *j_GetObjectArrayElement(void *env, void *arr, int i) {
   (void)env;
-  FakeObjArray *a = arr;
-  return (a && nx_tag_of(a) == TAG_OBJARR && i >= 0 && i < a->len) ? a->items[i] : NULL;
+  void **it = objarr_items(arr, i);
+  if (!it) return NULL;
+  void *v = it[i];
+  /* Do not hand poison back AS a jobject -- the caller will dereference it. */
+  if (v && (((uintptr_t)v & 3u) || (uintptr_t)v < 0x1000u)) return NULL;
+  return v;
 }
 static void j_SetObjectArrayElement(void *env, void *arr, int i, void *val) {
   (void)env;
-  FakeObjArray *a = arr;
-  if (a && nx_tag_of(a) == TAG_OBJARR && i >= 0 && i < a->len) a->items[i] = val;
+  /* Same single-load rule as the getter, and it matters more here: this one
+   * WRITES through the pointer, so a stale items[] would corrupt whatever now
+   * owns that memory rather than just returning a bad value. */
+  void **it = objarr_items(arr, i);
+  if (it) it[i] = val;
 }
 
 /* Round 145. Never return NULL from here.
@@ -2103,7 +2362,26 @@ static uint8_t g_pri_scratch[8192];
 static void *j_GetPriArrayElements(void *env, void *arr, uint8_t *is_copy) {
   (void)env; if (is_copy) *is_copy = 0;
   FakePriArray *a = arr;
-  if (a && nx_tag_of(a) == TAG_PRIARR) return a->data;
+  if (a && nx_tag_of(a) == TAG_PRIARR) {
+    /* Round 157: data CAN be NULL -- free_ref clears it before releasing the
+     * buffer (r155/A4), so a racing caller that already passed the tag check
+     * lands here with NULL. Returning it would reinstate the r145 crash;
+     * libunity's GetByteArrayElements caller does not null-check.
+     *
+     * Round 162: but a ZERO-LENGTH array legitimately has data == NULL.
+     * act_object answers every array-returning method it does not model with
+     * `make_pri_array_adopt(NULL, 0, esz)`, which is the correct Java answer
+     * ("none available"), and r157 was reporting each one as an unrecognised
+     * ref. That is how InputDevice.getDeviceIds()[I produced two alarming log
+     * lines per boot in every tester log. Same safe pointer either way -- just
+     * stop calling a correct empty array a corrupt one. */
+    void *d = *(void * volatile const *)&a->data;
+    if (d) return d;
+    if (*(int volatile const *)&a->len == 0) {
+      memset(g_pri_scratch, 0, sizeof g_pri_scratch);
+      return g_pri_scratch;          /* empty array: nothing to read anyway */
+    }
+  }
   /* Shared and not thread-safe on purpose: this is a degradation path, and a
    * racing second caller getting the same zeroed bytes is still better than a
    * store to page 0. */
@@ -2123,14 +2401,20 @@ static void j_ReleasePriArrayElements(void *env, void *arr, void *elems, int mod
 static void j_GetPriArrayRegion(void *env, void *arr, int start, int len, void *buf) {
   (void)env;
   FakePriArray *a = arr;
-  if (a && nx_tag_of(a) == TAG_PRIARR && start >= 0 && start + len <= a->len)
-    memcpy(buf, (char *)a->data + (size_t)start * a->elem_size, (size_t)len * a->elem_size);
+  if (!a || nx_tag_of(a) != TAG_PRIARR || !buf) return;
+  void *d = *(void * volatile const *)&a->data;      /* may be NULL: see above */
+  const int n = *(int volatile const *)&a->len;
+  if (!d || start < 0 || len < 0 || start + len > n) return;
+  memcpy(buf, (char *)d + (size_t)start * a->elem_size, (size_t)len * a->elem_size);
 }
 static void j_SetPriArrayRegion(void *env, void *arr, int start, int len, const void *buf) {
   (void)env;
   FakePriArray *a = arr;
-  if (a && nx_tag_of(a) == TAG_PRIARR && start >= 0 && start + len <= a->len)
-    memcpy((char *)a->data + (size_t)start * a->elem_size, buf, (size_t)len * a->elem_size);
+  if (!a || nx_tag_of(a) != TAG_PRIARR || !buf) return;
+  void *d = *(void * volatile const *)&a->data;      /* may be NULL: see above */
+  const int n = *(int volatile const *)&a->len;
+  if (!d || start < 0 || len < 0 || start + len > n) return;
+  memcpy((char *)d + (size_t)start * a->elem_size, buf, (size_t)len * a->elem_size);
 }
 
 // --- fields -----------------------------------------------------------------
@@ -2145,11 +2429,9 @@ static void j_SetPriArrayRegion(void *env, void *arr, int start, int len, const 
 // Placeholders marked CHECK are safe defaults, not the shipped values; the game
 // never verifies them against anything but a stubbed RemoteConfig, so exact
 // numbers don't gate boot. Easy to correct once known.
-/* PHIGROS. Both are PLACEHOLDERS -- read the real values off your own APK:
- *     aapt dump badging Phigros.apk | head -1
- * Nothing in the boot path verifies them, but Phigros surfaces versionName in
- * its own settings UI and any SDK that keys off it will see this string, so
- * shipping Zookeeper's (which the upstream tree still had here) is wrong. */
+/* PHIGROS. Placeholders -- read the real values off your own APK with
+ * `aapt dump badging`. Nothing in the boot path verifies them, but Phigros
+ * surfaces versionName in its own settings UI. */
 #define APP_VERSION_NAME "3.0.0"   /* CHECK YOUR MANIFEST */
 #define APP_VERSION_CODE 1         /* CHECK YOUR MANIFEST */
 #define NX_SDK_INT       33        /* Android 13 -- high enough to pass any minSdk gate  */
@@ -2255,8 +2537,8 @@ static juint field_int(const FakeID *id) {
   const char *n = id->name, *c = id->cls;
   { const int sl = field_slot(id);      /* a write wins over the default */
     if (sl >= 0 && g_field_kind[sl] == FLD_WORD) return (juint)g_field_w[sl]; }
-  /* Phigros: NativeAudio$DeviceAudioInformation. Consulted after the write
-   * override (so a Set*Field still wins) but before the generic table. */
+  /* Phigros: NativeAudio$DeviceAudioInformation. After the write override so a
+   * Set*Field still wins, before the generic table. */
   { uint64_t pv; if (phigros_field_int(id, &pv)) return (juint)pv; }
   if (!strcmp(n, "what") && name_has(c, "Message")) return (juint)g_msg_what;
   if (!strcmp(n, "versionCode")) return APP_VERSION_CODE;
@@ -2603,13 +2885,20 @@ static void **env_table_ptr = env_table;
  * (otherwise static) FakeString / FakePriArray without duplicating the structs. */
 void *jni_bytearray_data(void *arr, int *len_out) {
   FakePriArray *a = arr;
-  if (a && nx_tag_of(a) == TAG_PRIARR) { if (len_out) *len_out = a->len; return a->data; }
+  if (a && nx_tag_of(a) == TAG_PRIARR) {
+    void *d = *(void * volatile const *)&a->data;
+    /* Never hand back a non-zero length with a NULL pointer -- callers in
+     * unity_jni.c/unity_input.c loop to len_out. */
+    if (d) { if (len_out) *len_out = *(int volatile const *)&a->len; return d; }
+  }
   if (len_out) *len_out = 0;
   return NULL;
 }
 const char *jni_string_utf(void *jstr) {
   FakeString *s = jstr;
-  return (s && nx_tag_of(s) == TAG_STRING) ? s->utf : "";
+  if (!s || nx_tag_of(s) != TAG_STRING) return "";
+  const char *u = *(const char * volatile const *)&s->utf;   /* may be NULL: see obj_str */
+  return u ? u : "";
 }
 
 void *fake_env = &env_table_ptr;

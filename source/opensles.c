@@ -211,6 +211,10 @@ typedef struct {
 typedef struct Player {
   void    *cur_own;      // mixer-owned copy of the block being played
   SLuint32 cur_own_cap;  // capacity of cur_own
+  int      flush_req;    // producer asks the mixer to drop the block in flight
+  SLuint32 blk;          // block size (frames) the producer enqueues
+  SLuint32 lvl;          // peak |sample| of the most recent enqueued block
+  SLuint32 clr;          // times the producer Cleared this queue
   const SLObjectItf_ *obj_vt;
   const SLPlayItf_   *play_vt;
   const SLBufferQueueItf_ *bq_vt;
@@ -284,9 +288,68 @@ static uint64_t g_movie_samples_played = 0;
  */
 static volatile uint32_t g_st_enq, g_st_consumed, g_st_dry, g_st_short, g_st_cb;
 
+/* Round 164 (from the Fruit Ninja tree). Counting callbacks is not enough --
+ * "audio died" and "audio is playing silence" look identical in a log where the
+ * only marker is one-shot. Tracking the running PEAK sample separates them:
+ *
+ *   callbacks rising, peak > 0   -- audio is fine
+ *   callbacks rising, peak == 0  -- the mixer runs but produces silence
+ *                                   (the game lost its sounds, not the shim)
+ *   callbacks flat               -- the device stopped pulling: our OpenSL/SDL
+ *                                   path died, not the game
+ *
+ * That decides whether the next fix belongs in the shim or above it, and there
+ * is no way to guess it from a log without this. peak is read-and-reset so each
+ * line describes the interval since the last one. */
+static volatile unsigned g_cb_count, g_cb_peak;
+static unsigned g_created, g_destroyed, g_reclaimed, g_lim_hits;
+static float    g_lim_gain = 1.0f;   /* limiter gain, see audio_callback */
+
 void phi_audio_stats(char *out, size_t cap) {
-  snprintf(out, cap, "enq=%u consumed=%u cb=%u dry=%u short=%u",
-           g_st_enq, g_st_consumed, g_st_cb, g_st_dry, g_st_short);
+  const unsigned cbs  = __atomic_load_n(&g_cb_count, __ATOMIC_RELAXED);
+  const unsigned peak = __atomic_exchange_n(&g_cb_peak, 0u, __ATOMIC_RELAXED);
+  /* Player rates are included because the repeating-buzz failure is a WRONG
+   * RATE, and a wrong rate is completely silent in a log otherwise -- the
+   * player is created, enqueues succeed, callbacks fire, every counter looks
+   * healthy, and it still sounds broken. One glance at "rates=" says whether
+   * this run negotiated sensibly. */
+  /* players= is the leak indicator: created/destroyed/reclaimed. A run where
+   * created keeps climbing while destroyed stays 0 is a producer abandoning
+   * output players, which get summed into every callback -- an echo AND a clip.
+   * (The previous buffer was 96 bytes and truncated the rate list to "240",
+   * which is precisely why that leak took an extra round to spot.) */
+  int n = snprintf(out, cap,
+                   "enq=%u consumed=%u cb=%u dry=%u short=%u dev_cb=%u peak=%u "
+                   "dev=%dHz players=%u/%u/%u lim=%u/%.2f rates=",
+                   g_st_enq, g_st_consumed, g_st_cb, g_st_dry, g_st_short, cbs, peak,
+                   g_dev_rate, g_created, g_destroyed, g_reclaimed,
+                   g_lim_hits, (double)g_lim_gain);
+  if (n < 0) return;
+  /* g_reg_lock is created by ensure_device, so it is NULL until the first
+   * player exists -- and this is called every frame from the render thread,
+   * which starts first. SDL_LockMutex(NULL) is undefined. */
+  if (!g_reg_lock) return;
+  SDL_LockMutex(g_reg_lock);
+  /* rate, then QUEUE DEPTH, per live player -- e.g. "24000*12".
+   *
+   * Depth is the discriminator the last round lacked. A dry player contributes
+   * nothing (mix_player returns early), so an accumulating pile of dry players
+   * is untidy but silent. Only a player with a BACKLOG can still be heard, and
+   * an abandoned one can hold up to BQ_SLOTS blocks -- several seconds of stale
+   * mix at 24 kHz, which would sound exactly like an echo.
+   *
+   * So: several entries with non-zero depth = abandoned players still audible,
+   * and the echo is real. Several entries all at depth 0 with one live = the
+   * leak is harmless and the repeat is something else. One line decides it. */
+  for (int i = 0; i < g_player_count && (size_t)n < cap; i++) {
+    const Player *q = g_players[i];
+    if (!q || !q->in_use) continue;
+    const int depth = (q->q_tail - q->q_head + BQ_SLOTS) % BQ_SLOTS;
+    n += snprintf(out + n, cap - (size_t)n, "%d%s%d/%u lvl%u c%u  ",
+                  q->rate, q->playing ? "*" : ":", depth,
+                  (unsigned)q->blk, (unsigned)q->lvl, (unsigned)q->clr);
+  }
+  SDL_UnlockMutex(g_reg_lock);
 }
 
 static float mb_to_linear(SLmillibel mb) {
@@ -322,6 +385,11 @@ static void mix_player(Player *p, int32_t *acc, int frames) {
   // A playing player with nothing queued is a finished one-shot SE the engine
   // fired and never Destroy'd; count the dry callbacks so alloc can recycle it.
   SDL_LockMutex(p->lock);
+  /* Consume any flush the producer asked for. Done HERE, on the mixer thread,
+   * so cur* keeps its single-writer rule (see bq_Clear). */
+  const int flush = p->flush_req;
+  p->flush_req = 0;
+  if (flush) { p->cur = NULL; p->cur_pos = 0; p->cur_size = 0; p->cur_fpos = 0.0; }
   const int dry = (!p->cur) && (p->q_head == p->q_tail);
   SDL_UnlockMutex(p->lock);
   if (dry) {
@@ -344,12 +412,28 @@ static void mix_player(Player *p, int32_t *acc, int frames) {
   const int bps = stereo ? sbytes * 2 : sbytes;        // bytes per input frame
   // resample the player's own rate to the device rate (players come in at 22050
   // AND 44100; without this, off-rate voices play at the wrong speed/pitch).
-  const double ratio = g_dev_rate > 0 ? (double)p->rate / (double)g_dev_rate : 1.0;
+  /* A zero step is not "slow", it is stuck: cur_fpos never reaches n, so the
+   * block is never consumed, the callback never fires, and the player emits one
+   * sample forever. Belt and braces with the rate check at creation. */
+  double ratio = (g_dev_rate > 0 && p->rate > 0)
+                 ? (double)p->rate / (double)g_dev_rate : 1.0;
+  if (!(ratio > 1e-6) || ratio > 64.0) {
+    static int warned = 0;
+    if (!warned) { warned = 1;
+      debugPrintf("[fmod] OpenSL: bad resample step (player %d Hz, device %d Hz) "
+                  "-- forcing 1:1 so the mixer cannot stick\n", p->rate, g_dev_rate); }
+    ratio = 1.0;
+  }
 
   for (int i = 0; i < frames; i++) {
     // ensure cur holds a buffer whose integer sample index covers cur_fpos,
     // carrying the fractional remainder across buffer boundaries.
-    for (;;) {
+    /* Bounded. Each turn either breaks with data or consumes a block, so a
+     * producer that keeps handing back zero-length blocks from its callback
+     * would otherwise spin here forever -- inside the audio callback, with the
+     * device lock held, which stalls output rather than just dropping a sound. */
+    for (int guard = 0; ; guard++) {
+      if (guard > 64) { g_st_short++; return; }
       if (!p->cur) {
         /* Copy the block into a buffer the MIXER owns, while holding the lock.
          *
@@ -481,16 +565,56 @@ static void SDLCALL audio_callback(void *ud, Uint8 *stream, int len) {
 
   mix_movie(acc, frames);
 
-  int16_t *out = (int16_t *)stream;
-  int32_t peak = 0;
+  /* LIMIT rather than hard-clip.
+   *
+   * Measured, not guessed: a glitching session sat at peak 31103-32767 for its
+   * entire length, i.e. within half a dB of full scale, touching the rail. That
+   * is what this mixer does by construction -- it sums FMOD's master output,
+   * which is already mastered to near 0 dBFS, with NativeAudio's hitsounds at
+   * unity gain, and then hard-clips the total. Every hitsound that lands during
+   * loud music pushes the sum past the rail and gets chopped, which is a
+   * crunching, broken sound on the hits specifically.
+   *
+   * Android does not have this problem because FMOD and NativeAudio go to
+   * SEPARATE AudioTracks and the OS mixer provides the headroom. Here they meet
+   * in one accumulator, so the headroom has to come from us.
+   *
+   * A one-block limiter: attack immediately when the peak would clip, release
+   * slowly so the gain does not pump audibly between blocks. No look-ahead, so
+   * the first block of a sudden transient is still reduced rather than clipped,
+   * because the peak is measured before anything is written. */
+  int32_t raw = 0;
   for (int i = 0; i < frames * 2; i++) {
-    int32_t v = acc[i];
+    const int32_t a = acc[i] < 0 ? -acc[i] : acc[i];
+    if (a > raw) raw = a;
+  }
+#if PHI_AUDIO_LIMITER
+  const float need = (raw > PHI_AUDIO_LIMITER_CEILING)
+                     ? (float)PHI_AUDIO_LIMITER_CEILING / (float)raw : 1.0f;
+  if (need < g_lim_gain) { g_lim_gain = need; g_lim_hits++; }  /* attack: instant */
+  else g_lim_gain += (need - g_lim_gain) * PHI_AUDIO_LIMITER_RELEASE;
+  if (g_lim_gain > 1.0f) g_lim_gain = 1.0f;
+#else
+  g_lim_gain = 1.0f;   /* hard clip, as before */
+#endif
+
+  int16_t *out = (int16_t *)stream;
+  /* NOTE: `raw` -- the PRE-limiter peak -- is what gets reported, not the peak
+   * of what we write. Post-limiter output can never exceed the ceiling, so
+   * reporting it would show a healthy number by construction and blind the one
+   * diagnostic that identified the clipping in the first place. */
+  const int32_t peak = raw;
+  for (int i = 0; i < frames * 2; i++) {
+    int32_t v = (int32_t)((float)acc[i] * g_lim_gain);
     if (v > 32767) v = 32767;
     else if (v < -32768) v = -32768;
     out[i] = (int16_t)v;
-    int32_t a = v < 0 ? -v : v;
-    if (a > peak) peak = a;
   }
+  /* Retain what the one-shot message above throws away: a marker that fires
+   * once cannot tell "still fine" from "died an hour ago". */
+  __atomic_fetch_add(&g_cb_count, 1u, __ATOMIC_RELAXED);
+  if ((unsigned)peak > __atomic_load_n(&g_cb_peak, __ATOMIC_RELAXED))
+    __atomic_store_n(&g_cb_peak, (unsigned)peak, __ATOMIC_RELAXED);
   if (peak > 64) {
     static int once = 0;
     if (!once) { once = 1; debugPrintf("[fmod] OpenSL: first non-silent audio to device (peak=%d) -- SOUND IS ON\n", peak); }
@@ -732,6 +856,33 @@ static SLresult bq_Enqueue(void *self, const void *pBuffer, SLuint32 size) {
     memcpy(b->own, pBuffer, size);
   b->data = b->own;
   b->size = size;
+  {
+    const int bps = (p->channels >= 2 ? 2 : 1) * (p->sbytes > 0 ? p->sbytes : 2);
+    if (!p->blk) p->blk = bps ? size / (SLuint32)bps : 0;
+
+    /* Peak of the block AS SUBMITTED. This is the one measurement that splits
+     * the remaining possibilities cleanly:
+     *
+     *   lvl stays 0 on the NativeAudio players -> the producer is handing us
+     *     silence, so the sound is being lost ABOVE this shim (the plugin, its
+     *     Java bridge, or the game) and nothing in the mixer can fix it.
+     *   lvl is healthy but the output is silent -> we are losing it DOWN here,
+     *     and the mixer or the queue is at fault.
+     *
+     * Measured on the producer's own thread at submit time, before anything
+     * else can touch the data. 16-bit stereo only, which is what both producers
+     * use; anything else reports 0 rather than guessing at the layout. */
+    if (p->sbytes == 2 && !p->is_float && size) {
+      const int16_t *ps = (const int16_t *)b->own;
+      const SLuint32 n = size / 2u;
+      int32_t mx = 0;
+      for (SLuint32 k = 0; k < n; k++) {
+        int32_t a = ps[k] < 0 ? -(int32_t)ps[k] : (int32_t)ps[k];
+        if (a > mx) mx = a;
+      }
+      p->lvl = (SLuint32)mx;
+    }
+  }
   p->q_tail = next;
   g_st_enq++;
   SDL_UnlockMutex(p->lock);
@@ -757,20 +908,24 @@ static void bq_free_slots(Player *p) {
 static SLresult bq_Clear(void *self) {
   Player *p = CONTAINER(self, Player, bq_vt);
   SDL_LockMutex(p->lock);
-  /* Queue indices only. cur/cur_pos/cur_size/cur_fpos describe the block the
-   * MIXER is playing out of, and the mixer reads them without the lock -- so
-   * clearing them from the producer thread is a race: null p->cur between the
-   * mixer's `if (!p->cur)` test and its next use and it dereferences NULL.
+  /* Empty the queue and ASK the mixer to drop the block in flight.
    *
-   * Leaving them alone makes those fields mixer-private, which removes the race
-   * entirely rather than narrowing it. The cost is that a cleared player
-   * finishes the block already in flight -- a few milliseconds -- before it
-   * finds the queue empty and goes quiet. SetPlayState(STOPPED) still stops it
-   * immediately, so an actual stop is unaffected; this only concerns Clear.
+   * cur/cur_pos/cur_size/cur_fpos describe what the mixer is playing and the
+   * mixer reads them without the lock, so writing them from this thread is a
+   * race -- null p->cur between the mixer's `if (!p->cur)` test and its next
+   * use and it dereferences NULL. A previous revision avoided that by simply
+   * not clearing them, which removed the race but let a cleared player finish
+   * the old block: on a one-shot that is replayed several times a second, the
+   * tail of the PREVIOUS hit is heard before the new one, which sounds exactly
+   * like a repeat.
    *
-   * The block itself is safe to keep playing: since the mixer copies into its
-   * own cur_own buffer, it does not point into the queue any more. */
+   * A request flag gets both. The producer only sets flush_req; the mixer
+   * clears the state itself, on its own thread, at the top of mix_player. So
+   * Clear takes effect within one callback (sub-millisecond, inaudible) and
+   * cur* is still only ever written by the mixer. */
   p->q_head = p->q_tail = 0;
+  p->flush_req = 1;
+  p->clr++;
   SDL_UnlockMutex(p->lock);
   return SL_RESULT_SUCCESS;
 }
@@ -805,7 +960,14 @@ static const SLBufferQueueItf_ bq_vtable = {
 static SLresult play_SetPlayState(void *self, SLuint32 state) {
   Player *p = CONTAINER(self, Player, play_vt);
   SDL_LockMutex(p->lock);
+  const int was = p->playing;
   p->playing = (state == SL_PLAYSTATE_PLAYING);
+  /* Any state change drops whatever was mid-flight. Stopping must not leave a
+   * half-played block to be resumed later, and STARTING must not begin by
+   * emitting the tail of the previous sound -- which is what a one-shot voice
+   * being reused for the next hitsound would otherwise do. Same request flag as
+   * bq_Clear, so the mixer still owns cur*. */
+  if (was != p->playing) p->flush_req = 1;
   SDL_UnlockMutex(p->lock);
   if (p->playing) {
     static int once = 0;
@@ -954,6 +1116,7 @@ static void player_Destroy(void *self) {
   if (p->lock) SDL_DestroyMutex(p->lock);
   bq_free_slots(p);
   free(p);
+  g_destroyed++;
 }
 
 // --- engine interface -------------------------------------------------------
@@ -987,7 +1150,41 @@ static SLresult eng_CreateAudioPlayer(void *self, SLObjectItf *pPlayer, SLDataSo
     // (adds a trailing 'representation' field: 1=signed int, 2=float, 3=unsigned).
     if (fmt->formatType == 2 || fmt->formatType == 4) {
       p->channels = fmt->numChannels ? (int)fmt->numChannels : 2;
-      p->rate = fmt->samplesPerSec ? (int)(fmt->samplesPerSec / 1000) : 44100;
+      /* samplesPerSec is MILLIhertz per the OpenSL spec, so 48 kHz arrives as
+       * 48000000. Producers that pass plain Hz are a well-known footgun, and
+       * dividing those by 1000 is catastrophic HERE rather than merely wrong:
+       * mix_player's resample step is rate/device_rate, so
+       *
+       *     48000 Hz mistaken for milliHz -> rate 48 -> step 0.001
+       *         => every input sample emitted ~1000 times
+       *     samplesPerSec < 1000          -> rate 0  -> step 0
+       *         => the same sample forever, and the block is NEVER consumed,
+       *            so the callback never fires and the player never recovers
+       *
+       * Both are a loud repeating buzz that persists for the rest of the
+       * session, and which one you get depends on what the producer negotiated
+       * on that boot -- i.e. it happens on some runs and not others.
+       *
+       * So: divide, then sanity-check. If the result is not a plausible audio
+       * rate, try the field as Hz; if that is not plausible either, fall back
+       * to the device rate (ratio 1.0, no resampling) rather than a value that
+       * makes the mixer stick. Loud, because a wrong rate here is inaudible in
+       * the log and unmistakable in the speakers. */
+      {
+        const uint32_t sps = fmt->samplesPerSec;
+        int r = sps ? (int)(sps / 1000) : 44100;
+        if (r < 4000 || r > 192000) {
+          const int as_hz = (int)sps;
+          const int chosen = (as_hz >= 4000 && as_hz <= 192000)
+                             ? as_hz : (g_dev_rate > 0 ? g_dev_rate : 48000);
+          debugPrintf("[fmod] OpenSL: implausible samplesPerSec=%u -> rate %d Hz; "
+                      "using %d Hz instead (a bad rate here plays as a repeating "
+                      "buzz, not as silence)\n",
+                      (unsigned)sps, r, chosen);
+          r = chosen;
+        }
+        p->rate = r;
+      }
       // stride is the container size (bits) when given, else the sample width.
       uint32_t stride_bits = fmt->containerSize ? fmt->containerSize : fmt->bitsPerSample;
       p->sbytes = stride_bits >= 32 ? 4 : 2;
@@ -1000,8 +1197,9 @@ static SLresult eng_CreateAudioPlayer(void *self, SLObjectItf *pPlayer, SLDataSo
                 fmt->formatType, fmt->numChannels, p->rate, fmt->bitsPerSample,
                 fmt->containerSize, p->sbytes, p->is_float ? "float" : "int");
   }
-  debugPrintf("[fmod] OpenSL CreateAudioPlayer: %d Hz, %d ch (FMOD output player)\n",
-              p->rate, p->channels);
+  g_created++;
+  debugPrintf("[fmod] OpenSL CreateAudioPlayer #%u: %d Hz, %d ch\n",
+              g_created, p->rate, p->channels);
 
   ensure_device(p->rate);
 
@@ -1011,6 +1209,24 @@ static SLresult eng_CreateAudioPlayer(void *self, SLObjectItf *pPlayer, SLDataSo
     if (g_players[i] == NULL) { slot = i; break; }
   if (slot < 0 && g_player_count < MAX_PLAYERS)
     slot = g_player_count++;
+  /* NOT reclaimed eagerly here, deliberately. An earlier revision added a loop
+   * at this point that freed any player with `playing && drained > 40`, to stop
+   * abandoned FMOD output players accumulating. Auditing it before shipping
+   * showed it was both useless and dangerous:
+   *
+   *   - Useless: `drained > 40` only matches DRY players, and mix_player
+   *     returns immediately on dry, so those players were already contributing
+   *     silence. Freeing them cannot lower the mix level or stop an echo.
+   *   - Dangerous: these logs show 5-second futex stalls and GC bailouts. A
+   *     LIVE output player stalled that long is indistinguishable from an
+   *     abandoned one, and freeing it while FMOD still holds the pointer is a
+   *     use-after-free on the master audio output.
+   *
+   * The pool-full path below runs the same test, but only as a last resort at
+   * 64 players -- a situation never reached in practice (11 was the maximum
+   * observed). Confined there, the risk is acceptable; on every create it is
+   * not. If abandoned players do need reclaiming, the signal has to be "the
+   * producer stopped responding to our callback", not "it went quiet". */
   if (slot < 0) {
     // pool full: the engine never Destroys finished SEs, so reclaim one that has
     // been playing-but-silent for >~0.8s (a live BGM re-enqueues far sooner, so
@@ -1023,6 +1239,7 @@ static SLresult eng_CreateAudioPlayer(void *self, SLObjectItf *pPlayer, SLDataSo
         if (q->lock) SDL_DestroyMutex(q->lock);
         bq_free_slots(q);   /* or one block per slot leaks, forever */
         free(q);
+        g_reclaimed++;
         slot = i;
         break;
       }

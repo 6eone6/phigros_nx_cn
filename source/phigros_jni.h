@@ -13,10 +13,6 @@ uint64_t  phigros_dispatch_int   (void *recv, const void *id, va_list va);
 void      phigros_dispatch_void  (void *recv, const void *id, va_list va);
 float     phigros_dispatch_float (void *recv, const void *id, va_list va);
 
-/* Guarded replacement for a NativeAudio playback export, or NULL if we do not
- * guard that symbol. Consulted by dlsym_fake before the raw export. */
-void     *phigros_audio_guard(const char *sym);
-
 /* Field defaults. Returns 1 and writes *out if this module owns the field. */
 int       phigros_field_int(const void *id, uint64_t *out);
 

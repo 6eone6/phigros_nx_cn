@@ -53,6 +53,12 @@ static const PhiAssetReq PHI_REQUIRED_ASSETS[] = {
 #define PHI_AA_BUNDLE_EXT    ".bundle"
 
 /* ---- totals, for the staging sanity check ---------------------------- */
+/* Split out because bin/Data is the engine's own data -- scenes, resources,
+ * IL2CPP metadata. A short bundle count means missing SONGS; a short bin/Data
+ * means the engine has nothing to build a scene from and you get a black
+ * screen with the render loop happily ticking. They fail differently and are
+ * worth counting separately. */
+#define PHI_ASSET_DATA_COUNT 441
 #define PHI_ASSET_FILE_COUNT 2958
 #define PHI_ASSET_TOTAL_BYTES 2791569590ull
 

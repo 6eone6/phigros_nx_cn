@@ -49,4 +49,6 @@ void jni_approx_summary(const char *why);
 void jni_note_approx(const char *kind, const char *cls, const char *name,
                      const char *sig);
 
+void *jni_new_empty_array(const char *sig);
+
 #endif

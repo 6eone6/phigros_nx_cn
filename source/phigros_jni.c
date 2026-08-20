@@ -117,79 +117,75 @@ static void na_resolve(void) {
 }
 
 /* ---------------------------------------------------------------------- */
-/* Playback guards                                                        */
+/* Playback guards -- REMOVED, deliberately                               */
 /* ---------------------------------------------------------------------- */
-/* C# reaches the playback entry points through DllImport -> dlopen/dlsym, so
- * they bypass this file entirely and land straight in the plugin. Every one of
- * them indexes the source table without checking it, so if initialize failed
- * the first note played is a null dereference.
+/* There used to be wrapper functions here, handed out by dlsym in place of
+ * NativeAudio's real playback exports, so that a call made before the engine
+ * initialised would return harmlessly instead of dereferencing a null source
+ * table.
  *
- * These wrappers are handed out by dlsym instead of the raw exports. When the
- * table is present they tail-call the real function and cost one load; when it
- * is not, they return harmlessly. A rhythm game with no sound is bad, but it
- * still boots, still takes input, and still lets everything else be tested --
- * which a crash on the title screen does not. */
-/* Both verified against the shipped libnativeaudioe7.so, not assumed:
+ * They were removed because the cure was worse than the disease. A wrapper has
+ * to declare the function's signature in order to forward the call, and those
+ * signatures were GUESSED -- the plugin has no headers here. Checking them
+ * against the binary shows the guesses were wrong:
+ *
+ *     playAudioWithNativeSourceIndex   declared (int,int,float,float,float)
+ *                                      plugin uses w0,w1,w2 and s0,s1
+ *     setVolume                        declared (int,float)
+ *                                      plugin uses w0,w1,w2 and s0,s1,s2
+ *
+ * On AArch64 integers and floats occupy independent register banks, so a
+ * wrapper that declares two ints where the callee reads three does not merely
+ * reorder arguments -- it forwards the third integer UNSET. If that argument is
+ * a source or audio index, the plugin plays the wrong slot or nothing at all,
+ * silently, with no error anywhere. Silent hitsounds with healthy counters is
+ * exactly the shape of that bug.
+ *
+ * The protection they offered is now known to be unnecessary: every log since
+ * the argument-order fix shows "source table=0x..." non-NULL, so the null case
+ * does not arise. And if it ever did, an immediate fault at a known address is
+ * far easier to diagnose than silently mangled arguments -- that is precisely
+ * how the original null-table problem WAS diagnosed.
+ *
+ * Rule worth keeping: never interpose on a function whose signature you cannot
+ * verify. Resolving it straight through costs nothing and cannot be wrong. */
+
+/* ---------------------------------------------------------------------- */
+/* Plugin globals, and why there are no playback wrappers                   */
+/* ---------------------------------------------------------------------- */
+/* Both offsets verified against the shipped libnativeaudioe7.so, not assumed:
  *   prepareAudio 0x3b64  ldr x9,[x10,#0x58] -> global 0x2a058  (source table)
- *   initialize   0x3488  str w20,[x8,#0x60] -> global 0x2a060  (source count)
- * and 0x2a058 lies inside .bss (0x2a018-0x2a490), so it is zero until the
- * plugin allocates it -- which is exactly what makes it a reliable "did the
- * engine come up" flag. If the plugin is ever updated, re-derive these. */
+ *   initialize   0x3488  str w20,[x8,#0x60] -> global 0x2a060  (sample rate)
+ * 0x2a058 lies in .bss (0x2a018-0x2a490), so it is zero until the plugin
+ * allocates it -- which is what makes it a reliable "did the engine come up"
+ * check after initialize. Re-derive both if the plugin is ever updated.
+ *
+ * This file used to ALSO hand out dlsym wrappers for the playback exports
+ * (prepareAudio, playAudioWithNativeSourceIndex, setVolume, ...) so a failed
+ * init would give silence rather than a null dereference. They are gone,
+ * because their signatures were INVENTED -- there is no header for this plugin
+ * -- and checking them against the binary shows the guesses were wrong:
+ *
+ *     playAudioWithNativeSourceIndex  declared (int,int,float,float,float)
+ *                                     plugin uses w0,w1,w2 + s0,s1
+ *     setVolume                       declared (int,float)
+ *                                     plugin uses w0,w1,w2 + s0,s1,s2
+ *
+ * On AArch64 integers and floats use independent register banks, so declaring
+ * two ints where the callee takes three does not just reorder arguments: w2 is
+ * never set, and whatever was in it gets forwarded. If that argument is a
+ * source or audio index, the plugin plays the wrong slot or nothing at all,
+ * silently. That is a good description of "hitsounds stopped working".
+ *
+ * What they protected against does not happen -- the boot log shows the source
+ * table initialising non-NULL every run -- and if it ever did, a clean fault at
+ * a known address is far easier to diagnose than corrupted arguments. That is
+ * how the original null-table fault WAS diagnosed.
+ *
+ * Rule: never interpose on a function whose signature is a guess. Letting it
+ * resolve straight through costs nothing and cannot be wrong. */
 #define NA_SOURCE_TABLE_OFF 0x2a058
-/* 0x2a060 holds arg0. An earlier revision called it the source count; the
- * previous boot printed 256 there, which was the value passed as arg0 -- it is
- * the sample rate. Naming it correctly matters because it is what the log
- * reports back as proof the engine is configured right. */
 #define NA_RATE_OFF         0x2a060
-
-static int na_ready(void) {
-  if (!nativeaudio_loaded) return 0;
-  const uintptr_t nab = (uintptr_t)nativeaudio_mod.load_virtbase;
-  return *(void *const volatile *)(nab + NA_SOURCE_TABLE_OFF) != NULL;
-}
-static void na_guard_warn(const char *fn) {
-  static int warned = 0;
-  if (warned) return;
-  warned = 1;
-  debugPrintf("[na] %s called before the engine came up -- suppressing this and\n"
-              "[na] all later playback calls. Audio is silent by design here;\n"
-              "[na] without the guard this would be a null dereference.\n", fn);
-}
-#define NA_GUARD(name, ret, params, args, rv)                                  \
-  static ret na_##name params {                                                \
-    if (!na_ready()) { na_guard_warn(#name); return rv; }                       \
-    typedef ret (*fn_t) params;                                                 \
-    static fn_t real = NULL;                                                    \
-    if (!real) real = (fn_t)so_try_find_addr_rx(&nativeaudio_mod, #name);       \
-    if (!real) { na_guard_warn(#name); return rv; }                             \
-    return real args;                                                           \
-  }
-NA_GUARD(prepareAudio, int, (int a, int b), (a, b), -1)
-NA_GUARD(getNativeSource, int, (int a), (a), -1)
-NA_GUARD(playAudioWithNativeSourceIndex, int, (int a, int b, float c, float d, float e),
-         (a, b, c, d, e), -1)
-NA_GUARD(stopAudio, int, (int a), (a), -1)
-NA_GUARD(setVolume, int, (int a, float b), (a, b), -1)
-NA_GUARD(setPan, int, (int a, float b), (a, b), -1)
-NA_GUARD(getPlaybackTime, int, (int a), (a), 0)
-NA_GUARD(setPlaybackTime, int, (int a, float b), (a, b), -1)
-
-void *phigros_audio_guard(const char *sym) {
-  if (!sym || !nativeaudio_loaded) return NULL;
-  struct { const char *n; void *f; } tbl[] = {
-    { "prepareAudio",                   (void *)&na_prepareAudio },
-    { "getNativeSource",                (void *)&na_getNativeSource },
-    { "playAudioWithNativeSourceIndex", (void *)&na_playAudioWithNativeSourceIndex },
-    { "stopAudio",                      (void *)&na_stopAudio },
-    { "setVolume",                      (void *)&na_setVolume },
-    { "setPan",                         (void *)&na_setPan },
-    { "getPlaybackTime",                (void *)&na_getPlaybackTime },
-    { "setPlaybackTime",                (void *)&na_setPlaybackTime },
-  };
-  for (unsigned i = 0; i < sizeof(tbl)/sizeof(*tbl); i++)
-    if (!strcmp(sym, tbl[i].n)) return tbl[i].f;
-  return NULL;
-}
 
 int phigros_owns_class(const char *cls) {
   if (!cls) return 0;
