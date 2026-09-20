@@ -19,6 +19,15 @@ Android 版本中准备所需文件。
 
 https://nsthwj.cn/game/switch/136910
 
+## 开发动态
+
+项目开发进度、实机演示和版本更新会持续发布在：
+
+- 哔哩哔哩：[愛してるアイ的个人空间](https://space.bilibili.com/527174448)
+- 抖音：[6eone6 的抖音主页](https://v.douyin.com/YpGlMkzkYEA/)
+
+欢迎关注后续开发进展。
+
 自行编译、开发和研究请参阅下方说明及 GitHub Releases。
 [English](#english)
 
