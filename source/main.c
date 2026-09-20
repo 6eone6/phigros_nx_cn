@@ -1707,6 +1707,23 @@ int main(int argc, char *argv[]) {
                   "libunity differs (see PORTING)\n", *(volatile uint32_t *)(ub + PHI_PACING_GETTER));
     }
 
+    /* UI language override for Phigros CN 3.19.5.
+     * Java/JNI remains en/US; only Application.systemLanguage is zh-CN. */
+    {
+      volatile uint32_t *lang =
+          (volatile uint32_t *)(ub + PHI_SYSTEM_LANGUAGE_GETTER);
+      if (lang[0] == PHI_SYSTEM_LANGUAGE_ORIG) {
+        uint32_t zhcn[2] = { 0x52800500u, 0xD65F03C0u };
+        so_patch_code((void *)lang, zhcn, sizeof zhcn);
+        debugPrintf("[lang] Application.systemLanguage -> ChineseSimplified (40); Java locale en/US\n");
+      } else if (lang[0] == 0x52800500u && lang[1] == 0xD65F03C0u) {
+        debugPrintf("[lang] ChineseSimplified patch already present\n");
+      } else {
+        debugPrintf("[lang] SKIP UI language patch: +0x%x = 0x%08x, expected 0x%08x\n",
+                    PHI_SYSTEM_LANGUAGE_GETTER, lang[0], PHI_SYSTEM_LANGUAGE_ORIG);
+      }
+    }
+
     /* fbstub66: neutralise FMOD's OpenSL buffer-geometry validation.
      *
      * After slCreateEngine succeeds, FMOD's OpenSL init (+0xce67a0 -> continuation
@@ -2078,6 +2095,7 @@ int main(int argc, char *argv[]) {
       phi_audio_stats(ast, sizeof ast);
       unsigned iok = 0, irej = 0, icar = 0, isat = 0;
       android_native_input_stats(&iok, &irej, &icar, &isat);
+
       debugPrintf("[boot] frame %d rendered  [input] inj=%u rej=%u carry=%u sat=%u  "
                   "[audio] %s\n", frame, iok, irej, icar, isat, ast);
     }

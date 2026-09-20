@@ -166,19 +166,19 @@ static const NxPatchWord PHI_BRANCH_FORCES[] = { { 0, 0, 0 } };  /* placeholder 
  *   0x01949f50  bl   0x3a1bc00           ; <- the unsafe log call we SKIP
  *   0x01949f54  adrp x0,  0x1949000
  *   0x01949f58  adrp x8,  0x3fa8000
- *   0x01949f5c  add  x0, x0, #0xf78      ; x0 = 0x1949f78 (handler fn)
- *   0x01949f60  str  x19, [x8, #0x480]   ; g_vm = vm        -> 0x3fa8480
+ *   0x01949f5c  add  x0, x0, #0xf78      ; x0 = 0x197caa4 (handler fn)
+ *   0x01949f60  str  x19, [x8, #0x480]   ; g_vm = vm        -> 0x3fa8460
  *   0x01949f64  bl   0x19bf0b4           ; setter:  adrp x8, 0x3fa9000
- *                                        ;          str  x0,[x8,#0x420] -> 0x3fa9420
+ *                                        ;          str  x0,[x8,#0x420] -> 0x3fa9060
  *   0x01949f68  mov  w0,#6 ; movk w0,#1,lsl #16    ; JNI_VERSION_1_6
  *
  * Both targets verified inside libil2cpp .bss (0x3f985e0-0x41bfb80).
  * Structurally identical to PvZ's +0x3c09c18/+0x3c0abe8 and Fruit Ninja's
  * +0x34f1e80/+0x34f2730 pairs; the VALUES are ours.
  */
-#define PHI_IL2CPP_VM_GLOBAL      0x3fa8480  /* g_javavm            (.bss) */
-#define PHI_IL2CPP_HANDLER_SLOT   0x3fa9420  /* g_jni_handler_fnptr (.bss) */
-#define PHI_IL2CPP_HANDLER_FN     0x1949f78  /* value stored into the slot */
+#define PHI_IL2CPP_VM_GLOBAL      0x3fa8460  /* g_javavm            (.bss) */
+#define PHI_IL2CPP_HANDLER_SLOT   0x3fa9060  /* g_jni_handler_fnptr (.bss) */
+#define PHI_IL2CPP_HANDLER_FN     0x197caa4  /* value stored into the slot */
 #define PHI_HAVE_IL2CPP_VM        1
 
 /* ===========================================================================
@@ -208,6 +208,11 @@ static const NxPatchWord PHI_BRANCH_FORCES[] = { { 0, 0, 0 } };  /* placeholder 
  */
 #define PHI_PACING_GETTER     0x69c12c   /* Swappy::IsEnabledAndActive() */
 
+/* UI-only language override for Phigros CN 3.19.5. */
+#define PHI_SYSTEM_LANGUAGE_GETTER  0x3acd40
+#define PHI_SYSTEM_LANGUAGE_ORIG    0x140c30cfu
+#define PHI_SYSTEM_LANGUAGE_ZHCN    40
+
 /* ===========================================================================
  * 4. Boehm GC stop-the-world bridge  -- DERIVED, HIGH confidence
  * ===========================================================================
@@ -215,24 +220,24 @@ static const NxPatchWord PHI_BRANCH_FORCES[] = { { 0, 0, 0 } };  /* placeholder 
  * GC_start_world -- which is the signature this derivation depends on.
  *
  *   GC_suspend_all  @ ~0x19e1f20:
- *     adrp x22,0x41bc000 ; add x22,x22,#0xd00      ; GC_threads[] -> 0x41bcd00
+ *     adrp x22,0x41bc000 ; add x22,x22,#0xd00      ; GC_threads[] -> 0x41bc1b8
  *     ldr  x26,[x22, x21, lsl #3]                  ; 8-byte stride table walk
  *     ldr  x0, [x26,#8]                            ; GC_thread.id     +0x08
  *     ldr  x8, [x26,#0x10]                         ; .last_stop_count +0x10
- *     ldr  x9, [x23,#0xcd0]                        ; GC_stop_count -> 0x41bccd0
- *     ldr  w1, [x24,#0x4e4]                        ; suspend sig   -> 0x3f984e4
+ *     ldr  x9, [x23,#0xcd0]                        ; GC_stop_count -> 0x41bc188
+ *     ldr  w1, [x24,#0x4e4]                        ; suspend sig   -> 0x3f979ac
  *     bl   pthread_kill
  *
  *   GC_start_world  @ ~0x19e2180:
- *     ldr  w8, [x23,#0x4e0]                        ; retry_signals -> 0x3f984e0
+ *     ldr  w8, [x23,#0x4e0]                        ; retry_signals -> 0x3f979a8
  *     ldr  x9, [x26,#0xcd0] ; orr x9,x9,#1         ; GC_stop_count | 1
- *     ldr  w1, [x24,#0x4e8]                        ; restart sig   -> 0x3f984e8
+ *     ldr  w1, [x24,#0x4e8]                        ; restart sig   -> 0x3f979b0
  *     bl   pthread_kill
  *
  * Three consecutive 4-byte globals at +0x4e0/+0x4e4/+0x4e8 -- the same layout
  * PvZ found at 0x3bfbd40/44/48 and Fruit Ninja at 0x34e4680/84/88.
  *
- * The ack semaphore is il2cpp+0x41bcce0, confirmed THREE independent ways:
+ * The ack semaphore is il2cpp+0x41bc198, confirmed THREE independent ways:
  *   sem_init    @0x19e22b8 : adrp x0, 0x41bc000 ; add x0,x0,#0xce0
  *   sem_getvalue@0x19e2aa4 : same materialisation
  *   poll loop   @0x19e2af8 : adrp x21,0x41bc000 ; add x21,x21,#0xce0
@@ -255,18 +260,18 @@ static const NxPatchWord PHI_BRANCH_FORCES[] = { { 0, 0, 0 } };  /* placeholder 
  * in debug.log -- these have gone stale (game updated?). Re-run
  * tools/derive_gc_bridge.py.
  */
-#define GC_RETRY_SIGNALS_OFF_PHI 0x3f984e0 /* .data GC_retry_signals           */
-#define GC_START_ACK_OFF_PHI     0x3f984e0 /* alias of GC_RETRY_SIGNALS        */
-#define GC_SUSPEND_SIG_OFF_PHI   0x3f984e4 /* .data GC_suspend_all signal      */
-#define GC_RESTART_SIG_OFF_PHI   0x3f984e8 /* .data GC_start_world signal      */
-#define GC_ACK_SEM_OFF_PHI       0x41bcce0 /* .bss GC_suspend_ack_sem          */
-#define GC_STOP_COUNT_OFF_PHI    0x41bccd0 /* .bss GC_stop_count (ldar)        */
-#define GC_RESTART_SEM_OFF_PHI   0x41bccf0 /* .bss handler waits here -- INFERRED
+#define GC_RETRY_SIGNALS_OFF_PHI 0x3f979a8 /* .data GC_retry_signals           */
+#define GC_START_ACK_OFF_PHI     0x3f979a8 /* alias of GC_RETRY_SIGNALS        */
+#define GC_SUSPEND_SIG_OFF_PHI   0x3f979ac /* .data GC_suspend_all signal      */
+#define GC_RESTART_SIG_OFF_PHI   0x3f979b0 /* .data GC_start_world signal      */
+#define GC_ACK_SEM_OFF_PHI       0x41bc198 /* .bss GC_suspend_ack_sem          */
+#define GC_STOP_COUNT_OFF_PHI    0x41bc188 /* .bss GC_stop_count (ldar)        */
+#define GC_RESTART_SEM_OFF_PHI   0x41bc1a8 /* .bss handler waits here -- INFERRED
                                             * by layout (ack + 0x10, the same
                                             * delta Fruit Ninja has). Not
                                             * independently confirmed; used
                                             * only by the handler path.        */
-#define GC_THREADS_OFF_PHI       0x41bcd00 /* .bss GC_threads[]                */
+#define GC_THREADS_OFF_PHI       0x41bc1b8 /* .bss GC_threads[]                */
 /* GC_thread field offsets, read directly off the walk above. Same layout as
  * Fruit Ninja / acpc: next +0x00, id +0x08, last_stop_count +0x10,
  * stack_ptr +0x18, flags bytes at +0x20/+0x21. */

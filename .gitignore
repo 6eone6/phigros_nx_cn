@@ -1,0 +1,31 @@
+# Build outputs
+/build/
+*.elf
+*.nro
+*.nacp
+*.map
+*.lst
+*.o
+*.d
+
+# Extracted Phigros / Android files
+*.apk
+*.so
+global-metadata.dat
+/romfs/
+/game/
+
+# Save data
+prefs.kv
+
+# Temporary / backup files
+*.bak
+*.tmp
+*.orig
+*~
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

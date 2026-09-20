@@ -266,8 +266,7 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
      * wake it is paused. Release everyone before blocking. Defined with the rest
      * of the GC bridge further down; declared here because the futex path is the
      * one place the collector reliably blocks. */
-    void gc_bail_if_collector_blocks(volatile int32_t *);
-    gc_bail_if_collector_blocks(uaddr);
+    void gc_bail_if_collector_blocks(volatile int32_t *, int);
     long ret = 0;
     uint64_t __mw0 = armGetSystemTick();
     __atomic_add_fetch(&g_fx_wait, 1, __ATOMIC_RELAXED);
@@ -276,6 +275,11 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
       __atomic_add_fetch(&g_fx_eagain, 1, __ATOMIC_RELAXED);
       errno = EAGAIN; ret = -1;
     } else if (to) {
+      /* PHIGROS_GC_REALWAIT_FIX_R1: Linux futex WAIT only blocks when
+       * *uaddr still equals expected.  The old bridge resumed every
+       * mutator BEFORE this check, turning harmless EAGAIN calls into
+       * unsound mid-mark GC bailouts.  Bail only on a real sleep. */
+      gc_bail_if_collector_blocks(uaddr, val);
       /* round 71: FUTEX_WAIT takes a RELATIVE timeout; FUTEX_WAIT_BITSET
        * takes an ABSOLUTE deadline. Treating the latter as relative made it
        * effectively infinite, so it could never time out. */
@@ -288,6 +292,8 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
                     (int64_t)(to->tv_nsec - now_ts.tv_nsec);
         ns = (d > 0) ? (u64)d : 0ULL;
       } else {
+      /* PHIGROS_GC_REALWAIT_FIX_R1: value matched under futex bucket lock. */
+      gc_bail_if_collector_blocks(uaddr, val);
         ns = (u64)to->tv_sec * 1000000000ULL + (u64)to->tv_nsec;
       }
       __atomic_add_fetch(&g_fx_slept, 1, __ATOMIC_RELAXED);
@@ -1420,6 +1426,17 @@ static int oc_commit_locked(void *addr, size_t len) {
     if (W->committed[first + i]) { i++; continue; }
     size_t run = 0;
     while (i + run < cnt && !W->committed[first + i + run]) run++;
+
+    /* PHIGROS_STABILITY_R21_OC_CHUNK
+     * Avoid one large svcMapMemory alias operation.  The captured boot
+     * crash failed on a 4096-page (16 MiB) backing map even though only
+     * 105/512 MiB of the OC pool was live.  Existing accounting below
+     * advances i/oc_pool_bump, so limiting this run makes the same
+     * commit happen as a sequence of <=1 MiB mappings. */
+    {
+      const size_t oc_map_chunk_pages = (1u * 1024u * 1024u) / MMAP_PAGE;
+      if (run > oc_map_chunk_pages) run = oc_map_chunk_pages;
+    }
     if (oc_pool_bump + run > oc_pool_pages) {
       /* not enough never-used pages: serve what we can from the free list */
       if (oc_pool_freecnt == 0) {
@@ -2748,7 +2765,8 @@ static pthread_t g_gc_collector_pth;           /* same, cheap to compare */
  * need a mutator. The other ~32 of 33 still get a real, sound stop-the-world at
  * ~1.4 ms. */
 static void gc_resume_all(void);
-void gc_bail_if_collector_blocks(volatile int32_t *uaddr) {
+void gc_bail_if_collector_blocks(volatile int32_t *uaddr, int expected) {
+  (void)expected;
   if (!g_gc_stopped) return;                       /* hot path: one load */
   if (!pthread_equal(pthread_self(), g_gc_collector_pth)) return;
   /* Capture BEFORE resuming; log AFTER. Nothing may be logged between the pause
@@ -2801,6 +2819,7 @@ static void gc_resume_all(void) {
     return;                       /* the other one already resumed them */
   const uint64_t held = armTicksToNs(armGetSystemTick() - g_gc_stop_tick);
   diag_resume_list(g_gc_paused, g_gc_paused_n);   /* resume FIRST, measure after */
+  g_gc_paused_n_last = g_gc_paused_n; /* PHIGROS_GC_REALWAIT_FIX_R1 diag */
   g_gc_paused_n = 0;
 
   g_gc_pause_n++;

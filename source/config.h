@@ -96,7 +96,7 @@
  * If a scene ever pushes the pool past 512 the symptom is a hard OOM on an
  * uncommitted page (see above), and the fix is to take it back off the arena. */
 #define OC_POOL_BYTES       ((size_t)512 * 1024 * 1024)   // commit-pool (touched pages only)
-#define OC_POOL_MIN_BYTES   ((size_t)640 * 1024 * 1024)   // ladder floor; below the
+#define OC_POOL_MIN_BYTES   ((size_t)384 * 1024 * 1024)
                                                           // 551 MB live high-water there
                                                           // is no point continuing
 
@@ -497,7 +497,7 @@
 /* round 64: vsync/Choreographer pulse period. 16ms == ~60fps cap; the load
  * is frame-gated so a shorter period renders (and loads) faster. Delta-time
  * is hooked so game speed is unchanged. */
-#define PHI_VSYNC_PERIOD_NS 16000000ULL
+#define PHI_VSYNC_PERIOD_NS 16666667ULL
 #define PHI_SWAP_FINISH_N 8
 
 /* ---- libil2cpp hook gates (see patches/patch_sources.py) -----------------
