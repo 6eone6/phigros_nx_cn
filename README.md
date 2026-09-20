@@ -218,8 +218,21 @@ Android → Nintendo Switch save migration has been successfully tested
 for local progression data, including song unlocks, scores and
 illustrations.
 
-The conversion tooling is not yet ready for public use and is planned to
-be documented and published later.
+A ready-to-use fully unlocked save for Phigros CN 3.19.5 has not yet
+been prepared for release. It is currently planned to be included in
+a future Release alongside the adaptation for Phigros CN 3.20.0.
+
+## Roadmap
+
+- [x] Phigros CN 3.19.5
+- [x] IL2CPP / GC runtime adaptation
+- [x] 60 Hz timing adjustments
+- [x] Basic audio, touch and input support
+- [x] Android → Nintendo Switch save migration validation
+- [ ] FFmpeg video decoding backend
+- [ ] Unity VideoPlayer / story CG support
+- [ ] Prepare and publish a fully unlocked save
+- [ ] Support future Phigros CN versions
 
 ## Credits
 
