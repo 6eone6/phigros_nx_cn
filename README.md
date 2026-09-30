@@ -3,7 +3,7 @@
 > 在 Nintendo Switch 上运行 Phigros 国服 Android ARM64 版本的 Homebrew
 > 兼容层 / Loader。
 
-**当前适配版本：Phigros 国服 3.19.5**
+**当前适配版本：Phigros 国服 4.0.0**
 
 `phigros_nx_cn` 是基于
 [ChanseyIsTheBest/phigros_nx](https://github.com/ChanseyIsTheBest/phigros_nx)
@@ -37,23 +37,26 @@ https://nsthwj.cn/game/switch/136910
 
 目前主要适配：
 
--   Phigros 国服 3.19.5
+-   Phigros 国服 4.0.0
 -   Nintendo Switch / Atmosphère Homebrew 环境
 -   Unity 2022.3 / IL2CPP ARM64 Android 版本
 
 已经完成的主要工作：
 
--   [x] Phigros 国服 3.19.5 基础适配
+-   [x] Phigros 国服 4.0.0 基础适配
 -   [x] 国服 IL2CPP / GC 运行时适配
 -   [x] Nintendo Switch 运行稳定性修复
 -   [x] 60 Hz 时序调整
--   [x] 音频与游戏时序相关修复
+-   [x] BGM / OpenSL 音频输出适配
+-   [x] GC stop-the-world 稳定性修复
+-   [x] 高物量谱面运行性能优化
 -   [x] Android / JNI 兼容层调整
 -   [x] 触摸与输入适配
 -   [x] Android → Switch 存档迁移验证
 
-当前版本已经可以正常进入并游玩大部分游戏内容。
+当前版本已经完成实机稳定性测试，可正常进入并游玩大部分游戏内容。
 
+不同主机、性能/超频设置和音频输出环境可能存在不同程度的谱面/音频延迟，请使用游戏内的延迟设置自行校准。
 ### 已知问题：剧情 CG / VideoPlayer
 
 剧情 CG / Unity VideoPlayer 暂不可用。
@@ -69,7 +72,7 @@ Android MediaCodec 相关功能。
 
 ## 安装与运行
 
-你需要从自己合法获得的 **Phigros 国服 3.19.5 Android
+你需要从自己合法获得的 **Phigros 国服 4.0.0 Android
 版本**中提取运行所需文件。
 
 示例目录：
@@ -124,20 +127,22 @@ Android 存档不能简单直接复制到 Switch。
 Android → Nintendo Switch
 存档迁移已经完成验证，包括歌曲解锁、成绩、曲绘等本地进度。
 
-全解锁存档目前还没有整理为3.19.5使用的版本，后续计划将在适配3.20.0版本时加入Release。
+Phigros 国服 4.0.0 的 Android → Switch 存档迁移已经完成实机验证。
+迁移时需要正确处理 Unity PlayerPrefs 的 URI 编码以及 Switch 平台相关字段。
+
+建议迁移或替换 `prefs.kv` 前先备份原有存档。
 
 ------------------------------------------------------------------------
 
 ## Roadmap
 
--   [x] Phigros 国服 3.19.5
+-   [x] Phigros 国服 4.0.0
 -   [x] IL2CPP / GC 运行时适配
 -   [x] 60 Hz 时序调整
 -   [x] 基础音频、触摸和输入支持
 -   [x] Android → Switch 存档迁移验证
 -   [ ] FFmpeg 视频解码后端
 -   [ ] Unity VideoPlayer / 剧情 CG 支持
--   [ ] 整理并发布全解锁存档
 -   [ ] 后续 Phigros 国服版本适配
 
 ------------------------------------------------------------------------
@@ -182,7 +187,7 @@ Phigros、其游戏资源、音乐、美术、程序及相关商标的权利归�
 primarily focused on compatibility with the **Chinese Android release of
 Phigros** on Nintendo Switch.
 
-**Current target: Phigros CN 3.19.5**
+**Current target: Phigros CN 4.0.0**
 
 The project is a native compatibility layer / loader for the original
 ARM64 Android Unity/IL2CPP build.
@@ -195,16 +200,20 @@ required files from their own legally obtained copy.
 
 Implemented or adapted:
 
--   Phigros CN 3.19.5 compatibility
+-   Phigros CN 4.0.0 compatibility
 -   CN-specific IL2CPP / GC runtime adaptation
 -   Runtime stability fixes
 -   60 Hz timing adjustments
--   Audio and timing fixes
+-   BGM / OpenSL audio output adaptation
+-   GC stop-the-world stability fixes
+-   Performance optimizations for high-density charts
 -   Android / JNI compatibility improvements
 -   Touch and input support
 -   Android → Nintendo Switch save migration validation
 
-Most normal gameplay is currently functional.
+The current build has passed real-device stability testing and most normal gameplay is functional.
+
+Chart/audio latency can vary with the console, performance or overclock settings, and audio output configuration. Use the in-game latency setting to calibrate for your setup. The port does not force a fixed latency compensation value.
 
 ### Known issue: video playback
 
@@ -234,20 +243,19 @@ Android → Nintendo Switch save migration has been successfully tested
 for local progression data, including song unlocks, scores and
 illustrations.
 
-A ready-to-use fully unlocked save for Phigros CN 3.19.5 has not yet
-been prepared for release. It is currently planned to be included in
-a future Release alongside the adaptation for Phigros CN 3.20.0.
+Android → Nintendo Switch save migration for Phigros CN 4.0.0 has been validated on real hardware. Migration must correctly handle Unity PlayerPrefs URI encoding and Switch-specific platform fields.
+
+Back up the existing `prefs.kv` before migrating or replacing a save.
 
 ## Roadmap
 
-- [x] Phigros CN 3.19.5
+- [x] Phigros CN 4.0.0
 - [x] IL2CPP / GC runtime adaptation
 - [x] 60 Hz timing adjustments
 - [x] Basic audio, touch and input support
 - [x] Android → Nintendo Switch save migration validation
 - [ ] FFmpeg video decoding backend
 - [ ] Unity VideoPlayer / story CG support
-- [ ] Prepare and publish a fully unlocked save
 - [ ] Support future Phigros CN versions
 
 ## Credits
