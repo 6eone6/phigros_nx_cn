@@ -85,7 +85,7 @@ void debugLogClose(void) {
  * (observed: FMOD OutputOpenSL::init -> dlsym_fake -> debugPrintf parked on
  * g_log_lock while the whole engine stalled). newlib fopen/vfprintf/fflush
  * all malloc; vsnprintf into a fixed buffer + write() does not. */
-static volatile int g_log_on = 1;
+static volatile int g_log_on = PHI_RUNTIME_LOG_DEFAULT;
 
 /* Called by the exception handler so a fault is always recorded. */
 void debugLogForceOn(void) { g_log_on = 1; }

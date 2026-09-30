@@ -302,6 +302,7 @@ static volatile uint32_t g_st_enq, g_st_consumed, g_st_dry, g_st_short, g_st_cb;
  * is no way to guess it from a log without this. peak is read-and-reset so each
  * line describes the interval since the last one. */
 static volatile unsigned g_cb_count, g_cb_peak;
+static volatile uint64_t g_dev_frames;  /* exact stereo frames handed to SDL device */
 static unsigned g_created, g_destroyed, g_reclaimed, g_lim_hits, g_lim_bad_peak;
 static float    g_lim_gain = 1.0f;   /* limiter gain, see audio_callback */
 
@@ -319,9 +320,10 @@ void phi_audio_stats(char *out, size_t cap) {
    * (The previous buffer was 96 bytes and truncated the rate list to "240",
    * which is precisely why that leak took an extra round to spot.) */
   int n = snprintf(out, cap,
-                   "enq=%u consumed=%u cb=%u dry=%u short=%u dev_cb=%u peak=%u "
+                   "enq=%u consumed=%u cb=%u dry=%u short=%u dev_cb=%u dev_fr=%llu peak=%u "
                    "dev=%dHz players=%u/%u/%u lim=%u/%.2f/bad%u rates=",
-                   g_st_enq, g_st_consumed, g_st_cb, g_st_dry, g_st_short, cbs, peak,
+                   g_st_enq, g_st_consumed, g_st_cb, g_st_dry, g_st_short, cbs,
+                   (unsigned long long)__atomic_load_n(&g_dev_frames, __ATOMIC_RELAXED), peak,
                    g_dev_rate, g_created, g_destroyed, g_reclaimed,
                    g_lim_hits, (double)g_lim_gain, g_lim_bad_peak);
   if (n < 0) return;
@@ -623,6 +625,7 @@ static void SDLCALL audio_callback(void *ud, Uint8 *stream, int len) {
   /* Retain what the one-shot message above throws away: a marker that fires
    * once cannot tell "still fine" from "died an hour ago". */
   __atomic_fetch_add(&g_cb_count, 1u, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_dev_frames, (uint64_t)frames, __ATOMIC_RELAXED);
   if ((unsigned)peak > __atomic_load_n(&g_cb_peak, __ATOMIC_RELAXED))
     __atomic_store_n(&g_cb_peak, (unsigned)peak, __ATOMIC_RELAXED);
   if (peak > 64) {

@@ -1,6 +1,6 @@
 /* nx_patch_phigros.h -- in-memory libunity.so / libil2cpp.so patch table for
- * PHIGROS  (Unity 2022.3.62f2 / rev 7670c08855a9, arm64, IL2CPP).
- * Game libunity.so BuildID xxHash 80afbcbeffe6459a.
+ * PHIGROS CN 4.0.0 (Unity 2022.3.62f2 / rev 7670c08855a9, arm64, IL2CPP).
+ * Game libunity.so BuildID xxHash ba334a02d34169a0.
  *
  * ===========================================================================
  * DERIVED FOR THIS GAME  (see PORTING_PHIGROS.md)
@@ -47,7 +47,7 @@
  *      release build folded them (ICF) into one copy, so a 2-way-ambiguous
  *      reference pattern can never resolve uniquely by construction. A raw
  *      symbol-free scan found exactly one (LSR #28, MOVZ 0x10000000) adjacent
- *      pair, at 0x447258, inside the allocator cluster. -> sites 0 and 1.
+ *      pair, at 0x4bcc7c, inside the allocator cluster. -> sites 0 and 1.
  *   5. VERIFICATION
  *      - 15/15 symbol-derived sites byte-identical to the reference;
  *      - an independent raw scan re-found 15/15 of them;
@@ -75,29 +75,29 @@ typedef struct { uint32_t off, from, to; } NxPatchWord;
 
 /* '=' byte-identical to the symbolized reference; '#' raw-scan (folded ICF). */
 static const NxPatchWord PHI_PATCH_WORDS[] = {
-  /*  0 # */ { 0x447258, 0xd35cfc28, 0xd35afc28 },  /* TLSAllocator<N>::ThreadInitialize (folded)   lsr  #28->#26        */
-  /*  1 # */ { 0x44725c, 0x52a20009, 0x52a08009 },  /* TLSAllocator<N>::ThreadInitialize (folded)   movz 0x1000->0x0400  */
-  /*  2 = */ { 0x4469b4, 0x12be0009, 0x12bf8009 },  /* LocalLowLevelAllocator::ReserveMemoryBlock   MOVN gran-1  <<< R2 */
-  /*  3 = */ { 0x4469bc, 0x92648d36, 0x92669536 },  /* LocalLowLevelAllocator::ReserveMemoryBlock   and  ~(gran-1)       */
-  /*  4 = */ { 0x448cb4, 0x52a20009, 0x52a08009 },  /* BucketAllocator::BucketAllocator             movz 0x1000->0x0400  */
-  /*  5 = */ { 0x44af84, 0xd35cfd29, 0xd35afd29 },  /* DynamicHeapAllocator::DynamicHeapAllocator   lsr  #28->#26        */
-  /*  6 = */ { 0x44af88, 0x52a2000a, 0x52a0800a },  /* DynamicHeapAllocator::DynamicHeapAllocator   movz 0x1000->0x0400  */
-  /*  7 = */ { 0x44b430, 0x12be000a, 0x12bf800a },  /* DynamicHeapAllocator::RequestLargeAllocMem   MOVN gran-1  <<< R2 */
-  /*  8 = */ { 0x44b438, 0x92648d36, 0x92669536 },  /* DynamicHeapAllocator::RequestLargeAllocMem   and  ~(gran-1)       */
-  /*  9 = */ { 0x44d438, 0xd35cdc33, 0xd35ad433 },  /* VirtualAllocator::MarkMemoryBlocks           ubfx immr 28->26     */
-  /* 10 = */ { 0x44d43c, 0xd35cfd15, 0xd35afd15 },  /* VirtualAllocator::MarkMemoryBlocks           lsr  #28->#26        */
-  /* 11 = */ { 0x44d4cc, 0x52a20008, 0x52a08008 },  /* VirtualAllocator::ReserveMemoryBlock         movz 0x1000->0x0400  */
-  /* 12 = */ { 0x44d808, 0xd35cfc28, 0xd35afc28 },  /* VirtualAllocator::GetMemoryBlockFromPointer  lsr  #28->#26        */
-  /* 13 = */ { 0x44d818, 0x92646c28, 0x92667428 },  /* VirtualAllocator::GetMemoryBlockFromPointer  and 48-bit mask <<<R4 */
-  /* 14 = */ { 0x44d820, 0xd35c9c2a, 0xd35a942a },  /* VirtualAllocator::GetMemoryBlockFromPointer  ubfx immr 28->26     */
-  /* 15 = */ { 0x44d838, 0xd35cdc29, 0xd35ad429 },  /* VirtualAllocator::GetMemoryBlockFromPointer  ubfx immr 28->26     */
-  /* 16 = */ { 0x44d83c, 0xf2a2000b, 0xf2a0800b },  /* VirtualAllocator::GetMemoryBlockFromPointer  movk 0x1000->0x0400  */
-  /* 17 = */ { 0x44d87c, 0xcb0a7108, 0xcb0a6908 },  /* VirtualAllocator::GetMemoryBlockFromPointer  sub  lsl#28->lsl#26  */
-  /* 18 = */ { 0x44d834, 0xb25c6feb, 0xb25e77eb },  /* VirtualAllocator::GetMemoryBlockFromPointer  -256*gran     <<<R5 */
-  /* 19 = */ { 0x44d894, 0xd368fc28, 0xd366fc28 },  /* VirtualAllocator::GetBlockInfoFromPointer    L1 >>40->38   <<<R5 */
-  /* 20 = */ { 0x44d8a4, 0xd35c9c29, 0xd35a9429 },  /* VirtualAllocator::GetBlockInfoFromPointer    ubfx immr 28->26     */
-  /* 21 = */ { 0x44f558, 0xd368fc28, 0xd366fc28 },  /* MemoryManager::GetAllocatorContainingPtr     L1 >>40->38   <<<R5 */
-  /* 22 = */ { 0x44f570, 0xd35c9e89, 0xd35a9689 },  /* MemoryManager::GetAllocatorContainingPtr     ubfx immr 28->26     */
+  /*  0 # */ { 0x4c0c7c, 0xd35cfc28, 0xd35afc28 },  /* TLSAllocator<N>::ThreadInitialize (folded)   lsr  #28->#26        */
+  /*  1 # */ { 0x4c0c80, 0x52a20009, 0x52a08009 },  /* TLSAllocator<N>::ThreadInitialize (folded)   movz 0x1000->0x0400  */
+  /*  2 = */ { 0x4c03d8, 0x12be0009, 0x12bf8009 },  /* LocalLowLevelAllocator::ReserveMemoryBlock   MOVN gran-1  <<< R2 */
+  /*  3 = */ { 0x4c03e0, 0x92648d36, 0x92669536 },  /* LocalLowLevelAllocator::ReserveMemoryBlock   and  ~(gran-1)       */
+  /*  4 = */ { 0x4c26d8, 0x52a20009, 0x52a08009 },  /* BucketAllocator::BucketAllocator             movz 0x1000->0x0400  */
+  /*  5 = */ { 0x4c49a8, 0xd35cfd29, 0xd35afd29 },  /* DynamicHeapAllocator::DynamicHeapAllocator   lsr  #28->#26        */
+  /*  6 = */ { 0x4c49ac, 0x52a2000a, 0x52a0800a },  /* DynamicHeapAllocator::DynamicHeapAllocator   movz 0x1000->0x0400  */
+  /*  7 = */ { 0x4c4e54, 0x12be000a, 0x12bf800a },  /* DynamicHeapAllocator::RequestLargeAllocMem   MOVN gran-1  <<< R2 */
+  /*  8 = */ { 0x4c4e5c, 0x92648d36, 0x92669536 },  /* DynamicHeapAllocator::RequestLargeAllocMem   and  ~(gran-1)       */
+  /*  9 = */ { 0x4c6e5c, 0xd35cdc33, 0xd35ad433 },  /* VirtualAllocator::MarkMemoryBlocks           ubfx immr 28->26     */
+  /* 10 = */ { 0x4c6e60, 0xd35cfd15, 0xd35afd15 },  /* VirtualAllocator::MarkMemoryBlocks           lsr  #28->#26        */
+  /* 11 = */ { 0x4c6ef0, 0x52a20008, 0x52a08008 },  /* VirtualAllocator::ReserveMemoryBlock         movz 0x1000->0x0400  */
+  /* 12 = */ { 0x4c722c, 0xd35cfc28, 0xd35afc28 },  /* VirtualAllocator::GetMemoryBlockFromPointer  lsr  #28->#26        */
+  /* 13 = */ { 0x4c723c, 0x92646c28, 0x92667428 },  /* VirtualAllocator::GetMemoryBlockFromPointer  and 48-bit mask <<<R4 */
+  /* 14 = */ { 0x4c7244, 0xd35c9c2a, 0xd35a942a },  /* VirtualAllocator::GetMemoryBlockFromPointer  ubfx immr 28->26     */
+  /* 15 = */ { 0x4c725c, 0xd35cdc29, 0xd35ad429 },  /* VirtualAllocator::GetMemoryBlockFromPointer  ubfx immr 28->26     */
+  /* 16 = */ { 0x4c7260, 0xf2a2000b, 0xf2a0800b },  /* VirtualAllocator::GetMemoryBlockFromPointer  movk 0x1000->0x0400  */
+  /* 17 = */ { 0x4c72a0, 0xcb0a7108, 0xcb0a6908 },  /* VirtualAllocator::GetMemoryBlockFromPointer  sub  lsl#28->lsl#26  */
+  /* 18 = */ { 0x4c7258, 0xb25c6feb, 0xb25e77eb },  /* VirtualAllocator::GetMemoryBlockFromPointer  -256*gran     <<<R5 */
+  /* 19 = */ { 0x4c72b8, 0xd368fc28, 0xd366fc28 },  /* VirtualAllocator::GetBlockInfoFromPointer    L1 >>40->38   <<<R5 */
+  /* 20 = */ { 0x4c72c8, 0xd35c9c29, 0xd35a9429 },  /* VirtualAllocator::GetBlockInfoFromPointer    ubfx immr 28->26     */
+  /* 21 = */ { 0x4c8f7c, 0xd368fc28, 0xd366fc28 },  /* MemoryManager::GetAllocatorContainingPtr     L1 >>40->38   <<<R5 */
+  /* 22 = */ { 0x4c8f94, 0xd35c9e89, 0xd35a9689 },  /* MemoryManager::GetAllocatorContainingPtr     ubfx immr 28->26     */
 };
 #define PHI_PATCH_WORDS_N ((int)(sizeof(PHI_PATCH_WORDS)/sizeof(PHI_PATCH_WORDS[0])))
 
@@ -166,19 +166,19 @@ static const NxPatchWord PHI_BRANCH_FORCES[] = { { 0, 0, 0 } };  /* placeholder 
  *   0x01949f50  bl   0x3a1bc00           ; <- the unsafe log call we SKIP
  *   0x01949f54  adrp x0,  0x1949000
  *   0x01949f58  adrp x8,  0x3fa8000
- *   0x01949f5c  add  x0, x0, #0xf78      ; x0 = 0x197caa4 (handler fn)
- *   0x01949f60  str  x19, [x8, #0x480]   ; g_vm = vm        -> 0x3fa8460
+ *   0x01949f5c  add  x0, x0, #0xf78      ; x0 = 0x1b7c268 (handler fn)
+ *   0x01949f60  str  x19, [x8, #0x480]   ; g_vm = vm        -> 0x4438ea0
  *   0x01949f64  bl   0x19bf0b4           ; setter:  adrp x8, 0x3fa9000
- *                                        ;          str  x0,[x8,#0x420] -> 0x3fa9060
+ *                                        ;          str  x0,[x8,#0x420] -> 0x4439aa0
  *   0x01949f68  mov  w0,#6 ; movk w0,#1,lsl #16    ; JNI_VERSION_1_6
  *
  * Both targets verified inside libil2cpp .bss (0x3f985e0-0x41bfb80).
  * Structurally identical to PvZ's +0x3c09c18/+0x3c0abe8 and Fruit Ninja's
  * +0x34f1e80/+0x34f2730 pairs; the VALUES are ours.
  */
-#define PHI_IL2CPP_VM_GLOBAL      0x3fa8460  /* g_javavm            (.bss) */
-#define PHI_IL2CPP_HANDLER_SLOT   0x3fa9060  /* g_jni_handler_fnptr (.bss) */
-#define PHI_IL2CPP_HANDLER_FN     0x197caa4  /* value stored into the slot */
+#define PHI_IL2CPP_VM_GLOBAL      0x4438ea0  /* g_javavm            (.bss) */
+#define PHI_IL2CPP_HANDLER_SLOT   0x4439aa0  /* g_jni_handler_fnptr (.bss) */
+#define PHI_IL2CPP_HANDLER_FN     0x1b7c268  /* value stored into the slot */
 #define PHI_HAVE_IL2CPP_VM        1
 
 /* ===========================================================================
@@ -191,7 +191,7 @@ static const NxPatchWord PHI_BRANCH_FORCES[] = { { 0, 0, 0 } };  /* placeholder 
  * Choreographer callback (there is no Java Choreographer here).
  *
  * `Swappy::IsEnabledAndActive()` was named in the symbolized reference at
- * 0x126f690 and pinned into this binary at 0x69c12c: 10-instruction masked
+ * 0x126f690 and pinned into this binary at 0x72594c: 10-instruction masked
  * window, unique; immediate votes 3/3; opcode shape 20/24; and the pinned
  * disassembly is instruction-for-instruction identical to the reference apart
  * from the ADRP page and the two .bss byte offsets (0x231/0x230 here vs
@@ -206,11 +206,11 @@ static const NxPatchWord PHI_BRANCH_FORCES[] = { { 0, 0, 0 } };  /* placeholder 
  * 0xA9BF4FFE. Returning "pacing not active" is how the Zookeeper base already
  * boots -- it never enables Swappy.
  */
-#define PHI_PACING_GETTER     0x69c12c   /* Swappy::IsEnabledAndActive() */
+#define PHI_PACING_GETTER     0x72594c   /* Swappy::IsEnabledAndActive() */
 
 /* UI-only language override for Phigros CN 3.19.5. */
-#define PHI_SYSTEM_LANGUAGE_GETTER  0x3acd40
-#define PHI_SYSTEM_LANGUAGE_ORIG    0x140c30cfu
+#define PHI_SYSTEM_LANGUAGE_GETTER  0x400cd8u /* CN 4.0.0: Application.systemLanguage thunk */
+#define PHI_SYSTEM_LANGUAGE_ORIG    0x140d06f1u
 #define PHI_SYSTEM_LANGUAGE_ZHCN    40
 
 /* ===========================================================================
@@ -220,24 +220,24 @@ static const NxPatchWord PHI_BRANCH_FORCES[] = { { 0, 0, 0 } };  /* placeholder 
  * GC_start_world -- which is the signature this derivation depends on.
  *
  *   GC_suspend_all  @ ~0x19e1f20:
- *     adrp x22,0x41bc000 ; add x22,x22,#0xd00      ; GC_threads[] -> 0x41bc1b8
+ *     adrp x22,0x41bc000 ; add x22,x22,#0xd00      ; GC_threads[] -> 0x464cbf8
  *     ldr  x26,[x22, x21, lsl #3]                  ; 8-byte stride table walk
  *     ldr  x0, [x26,#8]                            ; GC_thread.id     +0x08
  *     ldr  x8, [x26,#0x10]                         ; .last_stop_count +0x10
- *     ldr  x9, [x23,#0xcd0]                        ; GC_stop_count -> 0x41bc188
- *     ldr  w1, [x24,#0x4e4]                        ; suspend sig   -> 0x3f979ac
+ *     ldr  x9, [x23,#0xcd0]                        ; GC_stop_count -> 0x464cbc8
+ *     ldr  w1, [x24,#0x4e4]                        ; suspend sig   -> 0x44263b4
  *     bl   pthread_kill
  *
  *   GC_start_world  @ ~0x19e2180:
- *     ldr  w8, [x23,#0x4e0]                        ; retry_signals -> 0x3f979a8
+ *     ldr  w8, [x23,#0x4e0]                        ; retry_signals -> 0x44263b0
  *     ldr  x9, [x26,#0xcd0] ; orr x9,x9,#1         ; GC_stop_count | 1
- *     ldr  w1, [x24,#0x4e8]                        ; restart sig   -> 0x3f979b0
+ *     ldr  w1, [x24,#0x4e8]                        ; restart sig   -> 0x44263b8
  *     bl   pthread_kill
  *
  * Three consecutive 4-byte globals at +0x4e0/+0x4e4/+0x4e8 -- the same layout
  * PvZ found at 0x3bfbd40/44/48 and Fruit Ninja at 0x34e4680/84/88.
  *
- * The ack semaphore is il2cpp+0x41bc198, confirmed THREE independent ways:
+ * The ack semaphore is il2cpp+0x464cbd8, confirmed THREE independent ways:
  *   sem_init    @0x19e22b8 : adrp x0, 0x41bc000 ; add x0,x0,#0xce0
  *   sem_getvalue@0x19e2aa4 : same materialisation
  *   poll loop   @0x19e2af8 : adrp x21,0x41bc000 ; add x21,x21,#0xce0
@@ -260,18 +260,18 @@ static const NxPatchWord PHI_BRANCH_FORCES[] = { { 0, 0, 0 } };  /* placeholder 
  * in debug.log -- these have gone stale (game updated?). Re-run
  * tools/derive_gc_bridge.py.
  */
-#define GC_RETRY_SIGNALS_OFF_PHI 0x3f979a8 /* .data GC_retry_signals           */
-#define GC_START_ACK_OFF_PHI     0x3f979a8 /* alias of GC_RETRY_SIGNALS        */
-#define GC_SUSPEND_SIG_OFF_PHI   0x3f979ac /* .data GC_suspend_all signal      */
-#define GC_RESTART_SIG_OFF_PHI   0x3f979b0 /* .data GC_start_world signal      */
-#define GC_ACK_SEM_OFF_PHI       0x41bc198 /* .bss GC_suspend_ack_sem          */
-#define GC_STOP_COUNT_OFF_PHI    0x41bc188 /* .bss GC_stop_count (ldar)        */
-#define GC_RESTART_SEM_OFF_PHI   0x41bc1a8 /* .bss handler waits here -- INFERRED
+#define GC_RETRY_SIGNALS_OFF_PHI 0x44263b0 /* .data GC_retry_signals           */
+#define GC_START_ACK_OFF_PHI     0x44263b0 /* alias of GC_RETRY_SIGNALS        */
+#define GC_SUSPEND_SIG_OFF_PHI   0x44263b4 /* .data GC_suspend_all signal      */
+#define GC_RESTART_SIG_OFF_PHI   0x44263b8 /* .data GC_start_world signal      */
+#define GC_ACK_SEM_OFF_PHI       0x464cbd8 /* .bss GC_suspend_ack_sem          */
+#define GC_STOP_COUNT_OFF_PHI    0x464cbc8 /* .bss GC_stop_count (ldar)        */
+#define GC_RESTART_SEM_OFF_PHI   0x464cbe8 /* .bss handler waits here -- INFERRED
                                             * by layout (ack + 0x10, the same
                                             * delta Fruit Ninja has). Not
                                             * independently confirmed; used
                                             * only by the handler path.        */
-#define GC_THREADS_OFF_PHI       0x41bc1b8 /* .bss GC_threads[]                */
+#define GC_THREADS_OFF_PHI       0x464cbf8 /* .bss GC_threads[]                */
 /* GC_thread field offsets, read directly off the walk above. Same layout as
  * Fruit Ninja / acpc: next +0x00, id +0x08, last_stop_count +0x10,
  * stack_ptr +0x18, flags bytes at +0x20/+0x21. */
@@ -403,7 +403,7 @@ static const uint32_t PHI_LIVENESS_PROLOGUE[4] = { 0u, 0u, 0u, 0u };
  * NativeAudio, which drives our OpenSL shim directly. That split is exactly the
  * reported symptom: "all sound effects are perfect but no music plays". */
 #define PHI_HAVE_FMOD_OPENSL        1
-#define PHI_FMOD_OUTPUT_SITE        0x7c4844u
+#define PHI_FMOD_OUTPUT_SITE        0x8531d8u /* CN 4.0.0 AudioManager::InitNormal -> FMOD::System::setOutput */
 #define PHI_FMOD_WORDS_NUM          0
 static const NxPatchWord PHI_FMOD_WORDS[] = { { 0, 0, 0 } };  /* placeholder */
 #define PHI_HAVE_FMOD_BUFFER_BYPASS 0

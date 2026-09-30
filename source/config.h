@@ -132,7 +132,7 @@
 /* Bump when shipping. Printed at compile time (#pragma message in main.c)
  * and at boot, so a stale source tree is obvious from either the build
  * output or debug.log. */
-#define PHI_SRC_REV   "phigros-r1.1-audiodiag"
+#define PHI_SRC_REV   "phigros-4.0.0-stage6-perf-rc"
 
 /* ---- Android package name -- VERIFY THIS AGAINST YOUR APK -----------------
  * Returned by our fake getPackageName(). Unity surfaces it as
@@ -426,7 +426,14 @@
  * full [xd] dump to debug.log. What is gone is the per-frame and per-JNI-call
  * chatter, which on a long session was both a lot of SD writes and a real
  * source of jitter on a 3-core machine. Set back to 1 to diagnose. */
-#define DEBUG_LOG 0
+#define DEBUG_LOG 1
+
+/* Stage 6 performance RC: keep the logging machinery compiled in so a crash
+ * can force-enable a useful [xd] dump, but keep routine runtime logging off.
+ * This removes SD writes/formatting from gameplay without sacrificing crash
+ * evidence or rare debugLogNote() pressure/watchdog events. */
+#define PHI_RUNTIME_LOG_DEFAULT 0
+#define PHI_RUNTIME_DIAGNOSTICS 0
 
 /* GC stop-the-world (round 100).
  *
@@ -554,7 +561,7 @@
  * Makes use-after-free deterministic instead of layout-dependent -- see the
  * comment in nx_alloc.c's nx_free_inner. Costs one memset per free; set to 0 to
  * restore the previous behaviour exactly. */
-#define PHI_POISON_FREE 1
+#define PHI_POISON_FREE 0
 
 
 /* Diagnostic ONLY: call il2cpp_gc_disable() after init so no collection ever

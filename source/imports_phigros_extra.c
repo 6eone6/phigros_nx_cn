@@ -222,7 +222,8 @@ extern char **environ;
 /* ---- resolver table ----------------------------------------------------- */
 DynLibFunction phigros_extra_functions[] = {
   /* newlib passthroughs the core table lacks (see note above) */
-  { "cosh",    (uintptr_t)&cosh    },
+  { "cosh",       (uintptr_t)&cosh       },
+  { "nearbyintf", (uintptr_t)&nearbyintf },
   { "sinh",    (uintptr_t)&sinh    },
   { "tanh",    (uintptr_t)&tanh    },
   { "environ", (uintptr_t)&environ },

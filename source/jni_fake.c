@@ -841,10 +841,33 @@ static void handler_deliver_message(void *callback) {
                get_id("android/os/Handler$Callback", "handleMessage", "(Landroid/os/Message;)Z"), args);
 }
 static uint64_t g_frame_ns = 0;   /* frameTimeNanos for boxed-Long unboxing */
+/* Stage 5: observe the Java/Choreographer clock without changing it. */
+static volatile uint64_t g_chor_count = 0, g_chor_prev_ns = 0;
+static volatile uint64_t g_chor_min_ns = UINT64_MAX, g_chor_max_ns = 0, g_chor_late25 = 0;
+void jni_timing_snapshot(uint64_t *last_frame_ns, uint64_t *callback_count,
+                         uint64_t *min_interval_ns, uint64_t *max_interval_ns,
+                         uint64_t *late25_count) {
+  if (last_frame_ns) *last_frame_ns = __atomic_load_n(&g_frame_ns, __ATOMIC_RELAXED);
+  if (callback_count) *callback_count = __atomic_load_n(&g_chor_count, __ATOMIC_RELAXED);
+  uint64_t mn = __atomic_load_n(&g_chor_min_ns, __ATOMIC_RELAXED);
+  if (min_interval_ns) *min_interval_ns = (mn == UINT64_MAX) ? 0 : mn;
+  if (max_interval_ns) *max_interval_ns = __atomic_load_n(&g_chor_max_ns, __ATOMIC_RELAXED);
+  if (late25_count) *late25_count = __atomic_load_n(&g_chor_late25, __ATOMIC_RELAXED);
+}
 static void *g_frame_cb = 0;      /* registered Choreographer FrameCallback proxy */
 static void deliver_doframe(void *cb) {
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
   g_frame_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+  uint64_t prev = __atomic_exchange_n(&g_chor_prev_ns, g_frame_ns, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_chor_count, 1, __ATOMIC_RELAXED);
+  if (prev && g_frame_ns > prev) {
+    uint64_t d = g_frame_ns - prev;
+    uint64_t old = __atomic_load_n(&g_chor_min_ns, __ATOMIC_RELAXED);
+    while (d < old && !__atomic_compare_exchange_n(&g_chor_min_ns, &old, d, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    old = __atomic_load_n(&g_chor_max_ns, __ATOMIC_RELAXED);
+    while (d > old && !__atomic_compare_exchange_n(&g_chor_max_ns, &old, d, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    if (d > 25000000ull) __atomic_fetch_add(&g_chor_late25, 1, __ATOMIC_RELAXED);
+  }
   void *boxed = jni_make_object("java/lang/Long");
   void *args  = j_NewObjectArray(fake_env, 1, (void *)0, boxed);
   static int logged = 0;

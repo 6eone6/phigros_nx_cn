@@ -1707,7 +1707,7 @@ int main(int argc, char *argv[]) {
                   "libunity differs (see PORTING)\n", *(volatile uint32_t *)(ub + PHI_PACING_GETTER));
     }
 
-    /* UI language override for Phigros CN 3.19.5.
+    /* UI language override for Phigros CN 4.0.0.
      * Java/JNI remains en/US; only Application.systemLanguage is zh-CN. */
     {
       volatile uint32_t *lang =
@@ -1753,7 +1753,7 @@ int main(int argc, char *argv[]) {
     if (PHI_HAVE_FMOD_BUFFER_BYPASS &&
         *(volatile uint32_t *)(ub + PHI_FMOD_BUFFER_SITE) == 0x54000089u) {
       so_patch_code((void *)(ub + PHI_FMOD_BUFFER_SITE), &b_uncond, sizeof b_uncond);
-      debugPrintf("[fmod] OpenSL buffer-geometry check bypassed @libunity+0xe11404\n");
+      debugPrintf("[fmod] OpenSL buffer-geometry check bypassed @libunity+PHI_FMOD_BUFFER_SITE\n");
     } else {
       if (!PHI_HAVE_FMOD_BUFFER_BYPASS || !PHI_FMOD_BUFFER_SITE)
         debugPrintf("[fmod] buffer-geometry bypass not derived for this build -- skipped\n");
@@ -2067,7 +2067,13 @@ int main(int argc, char *argv[]) {
     android_native_update_mode();
     android_native_feed_hid((uint8_t (*)(void*,void*,void*,int))Unity_nativeInjectEvent,
                             fake_env, fake_unityplayer_thiz);
+    const uint64_t render_t0_ns = nx_now_ns();
     if (!Unity_nativeRender(fake_env, fake_unityplayer_thiz)) break;
+    const uint64_t render_ns = nx_now_ns() - render_t0_ns;
+    static uint64_t render_sum_ns = 0, render_max_ns = 0, render_over20 = 0, render_samples = 0;
+    render_sum_ns += render_ns; render_samples++;
+    if (render_ns > render_max_ns) render_max_ns = render_ns;
+    if (render_ns > 20000000ull) render_over20++;
     if (frame == 0) {
       /* fbstub42: install the native engine-clock fix first thing. Drives
        * TimeManager::Update with a live newTime so deltaTime / m_Time advance for
@@ -2084,7 +2090,7 @@ int main(int argc, char *argv[]) {
      * a burst of apply() calls into one file write instead of one each. */
     unity_prefs_tick();
 
-    if (frame < 5 || (frame % 120) == 0) {
+    if (PHI_RUNTIME_DIAGNOSTICS && (frame < 5 || (frame % 120) == 0)) {
       /* Audio counters alongside the frame counter. Printed HERE, on the main
        * thread, because the audio callback must never touch the log -- file I/O
        * from an audio thread is what stopped CloverPit's console booting. The
@@ -2096,8 +2102,24 @@ int main(int argc, char *argv[]) {
       unsigned iok = 0, irej = 0, icar = 0, isat = 0;
       android_native_input_stats(&iok, &irej, &icar, &isat);
 
-      debugPrintf("[boot] frame %d rendered  [input] inj=%u rej=%u carry=%u sat=%u  "
-                  "[audio] %s\n", frame, iok, irej, icar, isat, ast);
+      static uint64_t timing_t0 = 0;
+      const uint64_t now = armGetSystemTick();
+      if (!timing_t0) timing_t0 = now;
+      const unsigned long long wall_ms = armTicksToNs(now - timing_t0) / 1000000ull;
+      uint64_t chor_ns=0, chor_n=0, chor_min=0, chor_max=0, chor_late=0;
+      jni_timing_snapshot(&chor_ns, &chor_n, &chor_min, &chor_max, &chor_late);
+      const double probe_time = g_unity_time; /* local monotonic probe only; Time hooks are disabled */
+      const float probe_dt = g_unity_dt;
+      const unsigned long long ravg_us = render_samples ? (render_sum_ns / render_samples) / 1000ull : 0;
+      debugPrintf("[boot] frame %d rendered wall=%llums  [input] inj=%u rej=%u carry=%u sat=%u  "
+                  "[audio] %s [timing5] probe=%.6f dt=%.6f render_us=%llu/%llu over20=%llu "
+                  "chor_n=%llu chor_age_us=%lld chor_int_us=%llu/%llu chor_late25=%llu\n",
+                  frame, wall_ms, iok, irej, icar, isat, ast, probe_time, probe_dt,
+                  ravg_us, (unsigned long long)(render_max_ns/1000ull), (unsigned long long)render_over20,
+                  (unsigned long long)chor_n,
+                  chor_ns ? (long long)((nx_now_ns() - chor_ns)/1000ull) : -1ll,
+                  (unsigned long long)(chor_min/1000ull), (unsigned long long)(chor_max/1000ull),
+                  (unsigned long long)chor_late);
     }
 #if PHI_HAVE_FINISH_PROBE
     if (frame == 90 || frame == 300 || frame == 600 || frame == 1200)

@@ -23,6 +23,11 @@ extern void *fake_env; // JNIEnv *
 // set when the engine asks the activity to finish
 extern volatile int jni_quit_requested;
 
+/* Stage 5 timing probe: non-invasive Choreographer telemetry. */
+void jni_timing_snapshot(uint64_t *last_frame_ns, uint64_t *callback_count,
+                         uint64_t *min_interval_ns, uint64_t *max_interval_ns,
+                         uint64_t *late25_count);
+
 void jni_init(void);
 
 // the fake MyNativeActivity jobject handed to ANativeActivity.clazz

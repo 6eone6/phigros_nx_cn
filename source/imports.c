@@ -905,6 +905,7 @@ static void gl_TexImage2D_log(GLenum target, GLint level, GLint ifmt,
 static void gl_FramebufferTexture2D_log(GLenum target, GLenum att, GLenum textarget,
                                         GLuint tex, GLint level) {
   glFramebufferTexture2D(target, att, textarget, tex, level);
+  if (!PHI_RUNTIME_DIAGNOSTICS) return;
   if (tex >= 2300 && tex <= 2400) {
     static unsigned n;
     if (n < 3) { n++;
@@ -917,6 +918,7 @@ static void gl_FramebufferTexture2D_log(GLenum target, GLenum att, GLenum textar
 static GLuint g_fbo_bad[32]; static int g_fbo_bad_n;
 static void gl_BindFramebuffer_log(GLenum target, GLuint fb) {
   glBindFramebuffer(target, fb);
+  if (!PHI_RUNTIME_DIAGNOSTICS) return;
   if (!fb) return;                       /* default framebuffer is fine */
   GLenum st = glCheckFramebufferStatus(target);
   if (st == 0x8CD5 /*COMPLETE*/) return;
@@ -1038,7 +1040,7 @@ extern void android_native_draw_cursor(void);   /* docked cursor overlay (androi
 
 static EGLBoolean egl_SwapBuffers_log(EGLDisplay d, EGLSurface s) {
   g_swap_count++;
-  int trace = (g_swap_count <= 3) || (g_swap_count % 120 == 0);   /* boot + heartbeat */
+  int trace = PHI_RUNTIME_DIAGNOSTICS && ((g_swap_count <= 3) || (g_swap_count % 120 == 0));   /* boot + heartbeat */
   if (trace) {
     EGLint w = -1, h = -1;
     eglQuerySurface(d, s, 0x3057, &w);

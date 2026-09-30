@@ -5,7 +5,7 @@
  * Auto-extracted from THIS build's libunity.so by walking the
  * R_AARCH64_RELATIVE relocation map for JNINativeMethod{name,sig,fnPtr}
  * triples (30,031 relocs -> 52 native methods in 8 tables). The 29-method
- * table at 0x11e3390 is the UnityPlayer drive surface listed below.
+ * table at 0x126cbb0 is the UnityPlayer drive surface listed below.
  *
  * VERSION NOTE -- THIS IS THE GOOD CASE.
  * The loader-core lineage (Zookeeper DX) was built against Unity 2022.3.62f2.
@@ -24,40 +24,40 @@
 #include "so_util.h"
 
 /* ---- JNI_OnLoad (from .dynsym, not the reloc walk) ---------------------- */
-#define OFF_JNI_OnLoad                    0x6c61b0 /* (JavaVM*,reserved)->jint */
+#define OFF_JNI_OnLoad                    0x74f9d0 /* (JavaVM*,reserved)->jint */
 
 /* ---- drive-critical ----------------------------------------------------- */
-#define OFF_initJni                       0x6c53ac /* (env,thiz,Context)                  */
-#define OFF_nativeRecreateGfxState        0x6c55e0 /* (env,thiz,int,Surface)  set surface */
-#define OFF_nativeSendSurfaceChangedEvent 0x6c5648 /* (env,thiz)                          */
-#define OFF_nativeRender                  0x6c56a0 /* (env,thiz)->Z  per-frame; false=stop*/
-#define OFF_nativeInjectEvent             0x6c5700 /* (env,thiz,InputEvent,int)->Z  INPUT  */
-#define OFF_nativePause                   0x6c5448 /* (env,thiz)->Z                       */
-#define OFF_nativeResume                  0x6c54ac /* (env,thiz)                          */
-#define OFF_nativeFocusChanged            0x6c558c /* (env,thiz,Z)                        */
-#define OFF_nativeDone                    0x6c53b8 /* (env,thiz)->Z  shutdown             */
-#define OFF_nativeApplicationUnload       0x6c553c /* (env,thiz)                          */
-#define OFF_nativeLowMemory               0x6c54f4 /* (env,thiz)                          */
-#define OFF_nativeOrientationChanged      0x6c60f8 /* (env,thiz,int,int)                  */
+#define OFF_initJni                       0x74ebcc /* (env,thiz,Context)                  */
+#define OFF_nativeRecreateGfxState        0x74ee00 /* (env,thiz,int,Surface)  set surface */
+#define OFF_nativeSendSurfaceChangedEvent 0x74ee68 /* (env,thiz)                          */
+#define OFF_nativeRender                  0x74eec0 /* (env,thiz)->Z  per-frame; false=stop*/
+#define OFF_nativeInjectEvent             0x74ef20 /* (env,thiz,InputEvent,int)->Z  INPUT  */
+#define OFF_nativePause                   0x74ec68 /* (env,thiz)->Z                       */
+#define OFF_nativeResume                  0x74eccc /* (env,thiz)                          */
+#define OFF_nativeFocusChanged            0x74edac /* (env,thiz,Z)                        */
+#define OFF_nativeDone                    0x74ebd8 /* (env,thiz)->Z  shutdown             */
+#define OFF_nativeApplicationUnload       0x74ed5c /* (env,thiz)                          */
+#define OFF_nativeLowMemory               0x74ed14 /* (env,thiz)                          */
+#define OFF_nativeOrientationChanged      0x74f918 /* (env,thiz,int,int)                  */
 
 /* ---- messaging / misc --------------------------------------------------- */
-#define OFF_nativeUnitySendMessage        0x6c5d0c /* (env,thiz,String,String,byte[])     */
-#define OFF_nativeMuteMasterAudio         0x6c5f1c /* (env,thiz,Z)                        */
-#define OFF_nativeGetNoWindowMode         0x6c6158 /* (env,thiz)->Z                       */
-#define OFF_nativeIsAutorotationOn        0x6c5ebc /* (env,thiz)->Z                       */
-#define OFF_nativeSetLaunchURL            0x6c5f78 /* (env,thiz,String)                   */
-#define OFF_nativeHidePreservedContent    0x6c60b0 /* PRESENT in 62f2 (absent in FN's 0f1)*/
+#define OFF_nativeUnitySendMessage        0x74f52c /* (env,thiz,String,String,byte[])     */
+#define OFF_nativeMuteMasterAudio         0x74f73c /* (env,thiz,Z)                        */
+#define OFF_nativeGetNoWindowMode         0x74f978 /* (env,thiz)->Z                       */
+#define OFF_nativeIsAutorotationOn        0x74f6dc /* (env,thiz)->Z                       */
+#define OFF_nativeSetLaunchURL            0x74f798 /* (env,thiz,String)                   */
+#define OFF_nativeHidePreservedContent    0x74f8d0 /* PRESENT in 62f2 (absent in FN's 0f1)*/
 
 /* ---- soft keyboard (all 8 present) -------------------------------------- */
-#define OFF_nativeSetInputArea                0x6c59f4
-#define OFF_nativeSetKeyboardIsVisible        0x6c5a74
-#define OFF_nativeSetInputString              0x6c5acc
-#define OFF_nativeSetInputSelection           0x6c5b6c
-#define OFF_nativeSoftInputClosed             0x6c5cbc
-#define OFF_nativeSoftInputCanceled           0x6c5bd4
-#define OFF_nativeSoftInputLostFocus          0x6c5c24
-#define OFF_nativeReportKeyboardConfigChanged 0x6c5c74
-#define OFF_nativeGetSoftInputType            0x69b1d0 /* table @0x11e3178          */
+#define OFF_nativeSetInputArea                0x74f214
+#define OFF_nativeSetKeyboardIsVisible        0x74f294
+#define OFF_nativeSetInputString              0x74f2ec
+#define OFF_nativeSetInputSelection           0x74f38c
+#define OFF_nativeSoftInputClosed             0x74f4dc
+#define OFF_nativeSoftInputCanceled           0x74f3f4
+#define OFF_nativeSoftInputLostFocus          0x74f444
+#define OFF_nativeReportKeyboardConfigChanged 0x74f494
+#define OFF_nativeGetSoftInputType            0x7249f0 /* table @0x126c998          */
 
 /* ---- aliases / absent --------------------------------------------------- */
 /* The core calls nativeSendSurfaceChanged; this build only has the *Event

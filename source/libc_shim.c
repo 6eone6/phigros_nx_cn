@@ -267,6 +267,7 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
      * of the GC bridge further down; declared here because the futex path is the
      * one place the collector reliably blocks. */
     void gc_bail_if_collector_blocks(volatile int32_t *, int);
+    void gc_rearm_after_collector_wait(void);
     long ret = 0;
     uint64_t __mw0 = armGetSystemTick();
     __atomic_add_fetch(&g_fx_wait, 1, __ATOMIC_RELAXED);
@@ -339,6 +340,11 @@ static long futex_impl(volatile int32_t *uaddr, int op, int val, const struct ti
       }
     }
     mutexUnlock(&futex_lock[h]);
+    /* If the collector had to let paused mutators run to satisfy this futex,
+     * STOP THEM AGAIN before returning into the mark loop.  The old bailout
+     * resumed the world and then let marking continue permanently with mutators
+     * live, which the crash logs prove can sweep reachable objects. */
+    gc_rearm_after_collector_wait();
     { unsigned long long __d = armTicksToNs(armGetSystemTick() - __mw0);
       twait_add(gettid_fake(), __d); }
     if (g_main_tid && gettid_fake() == g_main_tid) {
@@ -2753,6 +2759,15 @@ static volatile uint64_t g_gc_stop_tick = 0;   /* when the pause began */
 static Handle g_gc_collector = 0;              /* who owns the current stop-world */
 static pthread_t g_gc_collector_pth;           /* same, cheap to compare */
 
+/* Stage 4: a collector futex may depend on a paused mutator.  Keep the exact
+ * pthread set across the emergency resume so it can be paused+captured again
+ * BEFORE futex_impl returns to Boehm's mark loop. */
+static pthread_t g_gc_paused_pth[GC_MAX_PAUSE];
+static pthread_t g_gc_rearm_pth[GC_MAX_PAUSE];
+static int g_gc_rearm_n = 0;
+static volatile int g_gc_rearm_pending = 0;
+static unsigned g_gc_rearms = 0, g_gc_rearm_fail = 0;
+
 /* The collector is about to block on a futex while the world is stopped. The
  * wake can only come from a thread we paused, so it will never arrive -- that is
  * the 500..1358 ms wedge in the round-109/110 logs, ending in a forced resume
@@ -2773,6 +2788,13 @@ void gc_bail_if_collector_blocks(volatile int32_t *uaddr, int expected) {
    * and the resume -- a paused thread may hold the log lock. */
   const void *ua = (const void *)uaddr;
   const unsigned uv = uaddr ? (unsigned)*uaddr : 0u;
+  /* Snapshot the suspended pthread identities before gc_resume_all clears the
+   * epoch.  No allocation/logging here: a suspended thread may own those locks. */
+  int rn = g_gc_paused_n;
+  if (rn > GC_MAX_PAUSE) rn = GC_MAX_PAUSE;
+  for (int i = 0; i < rn; i++) g_gc_rearm_pth[i] = g_gc_paused_pth[i];
+  g_gc_rearm_n = rn;
+  __atomic_store_n(&g_gc_rearm_pending, 1, __ATOMIC_RELEASE);
   gc_resume_all();
   g_gc_bailouts++;
   /* Round 136. This is the one fact the fix needs and the only one we have
@@ -2988,9 +3010,38 @@ static int nx_gc_pause_and_capture(pthread_t id, NxGcThread *gc_thread) {
     g_gc_collector_pth = pthread_self();
     g_gc_stopped = 1;
   }
-  if (g_gc_paused_n < GC_MAX_PAUSE) g_gc_paused[g_gc_paused_n++] = h;
+  if (g_gc_paused_n < GC_MAX_PAUSE) {
+    g_gc_paused[g_gc_paused_n] = h;
+    g_gc_paused_pth[g_gc_paused_n] = id;
+    g_gc_paused_n++;
+  }
   g_gc_cap_ok++;
   return 0;
+}
+
+/* Called by futex_impl after the collector's blocking futex has completed and
+ * after the futex bucket lock is released.  Re-capture every mutator that was
+ * temporarily resumed by gc_bail_if_collector_blocks().  This closes the old
+ * "resume mid-mark forever" hole.  We deliberately do not post GC acks here:
+ * these threads already acked this stop epoch; this only refreshes their roots
+ * and restores the stopped-world invariant before marking resumes. */
+void gc_rearm_after_collector_wait(void) {
+  if (!__atomic_exchange_n(&g_gc_rearm_pending, 0, __ATOMIC_ACQ_REL)) return;
+  int want = g_gc_rearm_n, ok = 0;
+  for (int i = 0; i < want; i++) {
+    pthread_t t = g_gc_rearm_pth[i];
+    NxGcThread *gt = nx_gc_find_thread(t);
+    if (gt && nx_gc_pause_and_capture(t, gt) == 0) ok++;
+  }
+  g_gc_rearms++;
+  if (ok != want) {
+    g_gc_rearm_fail++;
+    debugLogNote("[gc] *** REARM #%u INCOMPLETE after collector futex: recaptured %d/%d thread(s) ***\n",
+                 g_gc_rearms, ok, want);
+  } else {
+    debugPrintf("[gc] REARM #%u after collector futex: recaptured %d/%d thread(s) -- sound stop-world restored\n",
+                g_gc_rearms, ok, want);
+  }
 }
 
 void nx_gc_capture_stats(unsigned *ok, unsigned *no_thread, unsigned *no_handle,
